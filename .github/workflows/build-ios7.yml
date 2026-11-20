@@ -1032,15 +1032,31 @@ jobs:
           export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
           export RUSTFLAGS="${RUSTFLAGS:-} -C embed-bitcode=no"
 
-          # ---- diagnostics (non-fatal): which cfgs does the custom target get, and what does std's thread_local expect? ----
+          # ---- patch rust-src (build-std input) ----------------------------------------------------------------
+          # std assumes Apple targets always have native __thread TLS (needs iOS 9+ on armv7). iOS 7 has none, so the
+          # target sets has-thread-local=false and std must use its pthread-key based TLS, which it only enables
+          # for non-Apple unix. Allow it for Apple when target_thread_local is off.
+          set +e
+          STD_SRC="$(rustc "+$RUST_NIGHTLY" --print sysroot)/lib/rustlib/src/rust/library/std/src/sys"
+          set -e
+          python3 - "$STD_SRC/thread_local/mod.rs" <<'PYEOF'
+          import re, sys
+          p = sys.argv[1]
+          s = open(p).read()
+          if 'all(target_vendor = "apple", target_thread_local)' in s:
+              print("rust-src already patched")
+              sys.exit(0)
+          pat = re.compile(r'not\(target_vendor = "apple"\),(\s*)not\(target_family = "wasm"\),(\s*)target_family = "unix",')
+          new, n = pat.subn(r'not(all(target_vendor = "apple", target_thread_local)),\1not(target_family = "wasm"),\2target_family = "unix",', s)
+          if n != 1:
+              sys.exit("could not patch %s: expected 1 match for the thread_local key cfg, got %d" % (p, n))
+          open(p, "w").write(new)
+          print("patched", p)
+          PYEOF
+
           set +e
           echo "::group::target cfg"
-          rustc "+$RUST_NIGHTLY" --print cfg --target "$TARGET_JSON" -Z unstable-options 2>&1 | grep -E '^(unix|windows|target_(family|os|vendor|env|arch|pointer_width|thread_local))' | sort
-          echo "::endgroup::"
-          STD_SRC="$(rustc "+$RUST_NIGHTLY" --print sysroot)/lib/rustlib/src/rust/library/std/src/sys"
-          echo "::group::std sys/thread_local"
-          ls -R "$STD_SRC/thread_local" 2>&1 | head -40
-          for f in key/mod.rs mod.rs guard/mod.rs; do echo "----- thread_local/$f"; cat "$STD_SRC/thread_local/$f" 2>&1 | head -150; done
+          rustc "+$RUST_NIGHTLY" --print cfg --target "$TARGET_JSON" -Z unstable-options 2>&1 | grep -E '^(unix|target_(family|os|vendor|thread_local))' | sort
           echo "::endgroup::"
           set -e
 
