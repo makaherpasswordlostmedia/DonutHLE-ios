@@ -180,7 +180,7 @@ jobs:
           }
 
           - (BOOL)shouldAutorotate { return YES; }
-          - (NSUInteger)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
+          - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
           @end
           __DH_EOF__
           cat > ios/DHLibraryViewController.h <<'__DH_EOF__'
