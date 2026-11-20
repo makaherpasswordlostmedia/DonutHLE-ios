@@ -935,6 +935,24 @@ jobs:
           void os_unfair_lock_unlock(dh_unfair_lock *l) {
               __sync_lock_release(&l->opaque);
           }
+
+          /* std::fs::copy on Apple tries clonefile(2) (macOS 10.12 / iOS 10) first and falls back on ENOTSUP. */
+          #include <errno.h>
+          int fclonefileat(int srcfd, int dst_dirfd, const char *dst, int flags) {
+              (void)srcfd; (void)dst_dirfd; (void)dst; (void)flags;
+              errno = ENOTSUP;
+              return -1;
+          }
+          int fclonefile(int srcfd, const char *dst, int flags) {
+              (void)srcfd; (void)dst; (void)flags;
+              errno = ENOTSUP;
+              return -1;
+          }
+          int clonefile(const char *src, const char *dst, int flags) {
+              (void)src; (void)dst; (void)flags;
+              errno = ENOTSUP;
+              return -1;
+          }
           __DH_EOF__
           cat > ios/Info.plist <<'__DH_EOF__'
           <?xml version="1.0" encoding="UTF-8"?>
