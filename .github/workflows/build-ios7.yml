@@ -1,0 +1,1796 @@
+name: Build DonutHLE iOS 7 (armv7)
+
+# SINGLE-FILE PORT: drop only this file into .github/workflows/ of an unmodified DonutHLE checkout and run it.
+# It writes the whole ios/ app (Theos shell, target spec, shims) and patches the Rust core by itself:
+#   - GPU op-stream recording in gles.rs + runtime.rs/lib.rs FFI (donuthle_gpu_*), VM natives for alpha/cull/fog/tex-env
+#   - slice::as_chunks compat (the crate needs Rust 1.88 otherwise), zip without C-dependent features
+# Then: Rust staticlib for armv7-apple-ios7 (-Zbuild-std) + Theos app, cross-compiled on Linux. Outputs .ipa and .deb.
+# Toolchain/SDK steps follow ioskvm's ios.yml (Theos + L1ghtmann vanilla clang + iPhoneOS 9.3 SDK).
+
+on:
+  push:
+    paths: [".github/workflows/build-ios7.yml"]
+  workflow_dispatch: {}
+
+env:
+  RUST_NIGHTLY: nightly-2024-11-01
+  IOS_DEPLOY_TARGET: "7.0"
+
+jobs:
+  build-ios-armv7:
+    runs-on: ubuntu-24.04   # the iOS clang toolchain needs glibc >= 2.38
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write DonutHLE iOS 7 sources (ios/)
+        run: |
+          set -e
+          mkdir -p ios/targets ios/layout/DEBIAN
+          cat > ios/DHAppDelegate.h <<'__DH_EOF__'
+          #import <UIKit/UIKit.h>
+          @interface DHAppDelegate : UIResponder <UIApplicationDelegate>
+          @property (strong, nonatomic) UIWindow *window;
+          @end
+          __DH_EOF__
+          cat > ios/DHAppDelegate.m <<'__DH_EOF__'
+          #import "DHAppDelegate.h"
+          #import "DHLibraryViewController.h"
+
+          @implementation DHAppDelegate {
+              UINavigationController *_nav;
+              DHLibraryViewController *_library;
+          }
+
+          - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)options {
+              _library = [[DHLibraryViewController alloc] initWithStyle:UITableViewStylePlain];
+              _nav = [[UINavigationController alloc] initWithRootViewController:_library];
+              self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+              self.window.rootViewController = _nav;
+              [self.window makeKeyAndVisible];
+              return YES;
+          }
+
+          // "Open in DonutHLE" for .apk files: copy into Documents so the library sees it.
+          - (BOOL)application:(UIApplication *)app openURL:(NSURL *)url sourceApplication:(NSString *)src annotation:(id)anno {
+              if (![url isFileURL]) return NO;
+              NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+              NSString *dest = [docs stringByAppendingPathComponent:[url lastPathComponent]];
+              NSFileManager *fm = [NSFileManager defaultManager];
+              if (![[url path] isEqualToString:dest]) {
+                  [fm removeItemAtPath:dest error:nil];
+                  [fm copyItemAtPath:[url path] toPath:dest error:nil];
+              }
+              [_nav popToRootViewControllerAnimated:NO];
+              [_library reload];
+              return YES;
+          }
+          @end
+          __DH_EOF__
+          cat > ios/DHBridge.h <<'__DH_EOF__'
+          // C ABI exported by the Rust core (src/lib.rs, libdonuthle.a).
+          #ifndef DHBRIDGE_H
+          #define DHBRIDGE_H
+          #include <stdint.h>
+          #include <stddef.h>
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          const char *donuthle_core_info(void);
+          char *donuthle_launch_report(const char *apk_path);
+          void donuthle_free_string(char *s);
+          char *donuthle_game_title(void);
+          uint32_t donuthle_framebuffer_width(void);
+          uint32_t donuthle_framebuffer_height(void);
+          size_t donuthle_framebuffer_copy(uint8_t *out, size_t out_len);
+          uint32_t donuthle_render_frame(uint32_t w, uint32_t h);
+          int32_t donuthle_touch(int32_t action, float x, float y);
+          void donuthle_stop(void);
+          void donuthle_gpu_enable(int32_t enabled);
+          size_t donuthle_gpu_pending(void);
+          size_t donuthle_gpu_take(uint8_t *out, size_t out_len);
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif
+          __DH_EOF__
+          cat > ios/DHGameViewController.h <<'__DH_EOF__'
+          #import <UIKit/UIKit.h>
+          @interface DHGameViewController : UIViewController
+          - (instancetype)initWithAPKPath:(NSString *)path;
+          @end
+          __DH_EOF__
+          cat > ios/DHGameViewController.m <<'__DH_EOF__'
+          #import "DHGameViewController.h"
+          #import "DHScreenView.h"
+          #import "DHRunner.h"
+          #import "DHBridge.h"
+
+          @interface DHGameViewController () <UIAlertViewDelegate>
+          @end
+
+          @implementation DHGameViewController {
+              NSString *_path;
+              DHScreenView *_screen;
+              DHRunner *_runner;
+              UILabel *_status;
+          }
+
+          - (instancetype)initWithAPKPath:(NSString *)path {
+              if ((self = [super initWithNibName:nil bundle:nil])) {
+                  _path = [path copy];
+                  self.title = [[path lastPathComponent] stringByDeletingPathExtension];
+              }
+              return self;
+          }
+
+          - (void)loadView {
+              self.view = [[UIView alloc] init];
+              self.view.backgroundColor = [UIColor blackColor];
+          }
+
+          - (void)viewDidLoad {
+              [super viewDidLoad];
+              self.edgesForExtendedLayout = UIRectEdgeNone;
+              _screen = [[DHScreenView alloc] initWithFrame:self.view.bounds];
+              _screen.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              [self.view addSubview:_screen];
+
+              _status = [[UILabel alloc] initWithFrame:self.view.bounds];
+              _status.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              _status.textAlignment = NSTextAlignmentCenter;
+              _status.textColor = [UIColor whiteColor];
+              _status.backgroundColor = [UIColor clearColor];
+              _status.text = @"Booting\u2026";
+              _status.userInteractionEnabled = NO;
+              [self.view addSubview:_status];
+
+              // Rendering mode: GPU replay by default; defaults write org.donuthle.ios software 1 forces the CPU rasterizer.
+              BOOL gpu = ![[NSUserDefaults standardUserDefaults] boolForKey:@"software"];
+              _screen.gpu = gpu;
+              _runner = [[DHRunner alloc] initWithAPKPath:_path];
+              _runner.gpu = gpu;
+              __weak DHGameViewController *me = self;
+              _runner.onLaunched = ^(NSString *report, BOOL failed) { [me launched:report failed:failed]; };
+              DHRunner *runner = _runner;
+              _screen.touchHandler = ^(int a, float x, float y) { [runner touchAction:a x:x y:y]; };
+              [_runner start];
+          }
+
+          - (void)launched:(NSString *)report failed:(BOOL)failed {
+              _status.hidden = YES;
+              char *t = donuthle_game_title();
+              if (t) { if (!failed) self.title = [NSString stringWithUTF8String:t]; donuthle_free_string(t); }
+              if (failed) {
+                  [[[UIAlertView alloc] initWithTitle:@"Launch failed" message:report delegate:self
+                                    cancelButtonTitle:@"Back" otherButtonTitles:nil] show];
+              }
+          }
+
+          - (void)alertView:(UIAlertView *)a clickedButtonAtIndex:(NSInteger)i {
+              [self.navigationController popViewControllerAnimated:YES];
+          }
+
+          - (void)viewWillDisappear:(BOOL)animated {
+              [super viewWillDisappear:animated];
+              if ([self.navigationController.viewControllers containsObject:self]) return; // still on the stack
+              [_screen stopPresenting];
+              [_runner stopAndWait];
+              _runner = nil;
+          }
+
+          - (BOOL)shouldAutorotate { return YES; }
+          - (NSUInteger)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
+          @end
+          __DH_EOF__
+          cat > ios/DHLibraryViewController.h <<'__DH_EOF__'
+          #import <UIKit/UIKit.h>
+          @interface DHLibraryViewController : UITableViewController
+          - (void)reload;
+          @end
+          __DH_EOF__
+          cat > ios/DHLibraryViewController.m <<'__DH_EOF__'
+          #import "DHLibraryViewController.h"
+          #import "DHGameViewController.h"
+
+          @implementation DHLibraryViewController {
+              NSArray *_apks; // file names in Documents
+          }
+
+          - (NSString *)docsPath {
+              return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+          }
+
+          - (void)viewDidLoad {
+              [super viewDidLoad];
+              self.title = @"DonutHLE";
+              self.navigationItem.rightBarButtonItem =
+                  [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(reload)];
+              UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 320, 120)];
+              hint.numberOfLines = 0;
+              hint.textAlignment = NSTextAlignmentCenter;
+              hint.textColor = [UIColor grayColor];
+              hint.font = [UIFont systemFontOfSize:13];
+              hint.text = @"\nPut .apk files into this app's Documents folder\n(iTunes File Sharing, Filza, SSH)\nor use \u201cOpen in\u2026 DonutHLE\u201d.\n\nAndroid 1.x (API 1\u20134) only. Experimental.";
+              self.tableView.tableFooterView = hint;
+              [self reload];
+          }
+
+          - (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self reload]; }
+
+          - (void)reload {
+              NSArray *all = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[self docsPath] error:nil] ?: @[];
+              NSMutableArray *apks = [NSMutableArray array];
+              for (NSString *n in all) if ([[n pathExtension] caseInsensitiveCompare:@"apk"] == NSOrderedSame) [apks addObject:n];
+              _apks = [apks sortedArrayUsingSelector:@selector(caseInsensitiveCompare:)];
+              [self.tableView reloadData];
+          }
+
+          - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return (NSInteger)_apks.count; }
+
+          - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+              UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"apk"];
+              if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"apk"];
+              NSString *name = _apks[ip.row];
+              NSDictionary *at = [[NSFileManager defaultManager] attributesOfItemAtPath:[[self docsPath] stringByAppendingPathComponent:name] error:nil];
+              c.textLabel.text = name;
+              c.detailTextLabel.text = [NSString stringWithFormat:@"%.1f MB", [at fileSize] / 1048576.0];
+              c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+              return c;
+          }
+
+          - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+              [tv deselectRowAtIndexPath:ip animated:YES];
+              NSString *path = [[self docsPath] stringByAppendingPathComponent:_apks[ip.row]];
+              [self.navigationController pushViewController:[[DHGameViewController alloc] initWithAPKPath:path] animated:YES];
+          }
+          @end
+          __DH_EOF__
+          cat > ios/DHRunner.h <<'__DH_EOF__'
+          #import <Foundation/Foundation.h>
+
+          // Owns the thread that runs the Dalvik VM. The interpreter recurses deeply, so it gets a large stack
+          // (secondary threads default to 512 KB). All VM entry points (launch, render, touch) run on this one thread.
+          @interface DHRunner : NSObject
+          @property (nonatomic) BOOL gpu; // must be set before -start
+          @property (nonatomic, copy) void (^onLaunched)(NSString *report, BOOL failed); // called on the main queue
+          - (instancetype)initWithAPKPath:(NSString *)path;
+          - (void)start;
+          - (void)stopAndWait;
+          - (void)touchAction:(int)action x:(float)x y:(float)y; // Android MotionEvent actions: 0 down, 1 up, 2 move, 3 cancel
+          @end
+          __DH_EOF__
+          cat > ios/DHRunner.m <<'__DH_EOF__'
+          #import "DHRunner.h"
+          #import "DHBridge.h"
+
+          typedef struct { int action; float x, y; } DHTouch;
+
+          @implementation DHRunner {
+              NSString *_path;
+              NSThread *_thread;
+              NSMutableArray *_touches;      // NSValue(DHTouch), guarded by @synchronized(_touches)
+              NSConditionLock *_done;        // 0 = running, 1 = finished
+              volatile BOOL _stop;
+          }
+
+          - (instancetype)initWithAPKPath:(NSString *)path {
+              if ((self = [super init])) {
+                  _path = [path copy];
+                  _touches = [NSMutableArray array];
+                  _gpu = YES;
+                  _done = [[NSConditionLock alloc] initWithCondition:1];
+              }
+              return self;
+          }
+
+          - (void)start {
+              [_done lock]; [_done unlockWithCondition:0];
+              _thread = [[NSThread alloc] initWithTarget:self selector:@selector(run) object:nil];
+              _thread.name = @"DonutHLE VM";
+              _thread.stackSize = 16 * 1024 * 1024;
+              [_thread start];
+          }
+
+          - (void)stopAndWait {
+              _stop = YES;
+              [_done lockWhenCondition:1];
+              [_done unlock];
+          }
+
+          - (void)touchAction:(int)action x:(float)x y:(float)y {
+              DHTouch t = { action, x, y };
+              @synchronized (_touches) {
+                  if (_touches.count < 256) [_touches addObject:[NSValue valueWithBytes:&t objCType:@encode(DHTouch)]];
+              }
+          }
+
+          - (void)run {
+              @autoreleasepool {
+                  donuthle_gpu_enable(self.gpu ? 1 : 0);
+                  char *raw = donuthle_launch_report([_path fileSystemRepresentation]);
+                  NSString *report = raw ? [NSString stringWithUTF8String:raw] : @"Runtime returned no report";
+                  if (raw) donuthle_free_string(raw);
+                  BOOL failed = [report hasPrefix:@"Runtime error"];
+                  dispatch_async(dispatch_get_main_queue(), ^{ if (self.onLaunched) self.onLaunched(report, failed); });
+
+                  const double frame = 1.0 / 30.0;
+                  while (!failed && !_stop) {
+                      @autoreleasepool {
+                          NSArray *pending = nil;
+                          @synchronized (_touches) { pending = [_touches copy]; [_touches removeAllObjects]; }
+                          for (NSValue *v in pending) {
+                              DHTouch t; [v getValue:&t];
+                              donuthle_touch(t.action, t.x, t.y);
+                          }
+                          // GPU mode: let the presenter catch up instead of piling up frames (also pauses while backgrounded)
+                          while (!_stop && donuthle_gpu_pending() > 6u * 1024 * 1024) [NSThread sleepForTimeInterval:0.004];
+                          NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
+                          donuthle_render_frame(320, 480);
+                          NSTimeInterval spent = [NSDate timeIntervalSinceReferenceDate] - t0;
+                          if (spent < frame) [NSThread sleepForTimeInterval:frame - spent];
+                      }
+                  }
+                  donuthle_stop();
+              }
+              [_done lock]; [_done unlockWithCondition:1];
+          }
+          @end
+          __DH_EOF__
+          cat > ios/DHScreenView.h <<'__DH_EOF__'
+          #import <UIKit/UIKit.h>
+          // Presents the core's software framebuffer (RGBA8) aspect-fit and reports touches in virtual-screen coordinates.
+          @interface DHScreenView : UIView
+          @property (nonatomic) BOOL gpu; // replay the core's GLES op stream on the GPU (default) vs. present a CPU-rendered frame
+          @property (nonatomic, copy) void (^touchHandler)(int action, float x, float y);
+          - (void)stopPresenting;
+          @end
+          __DH_EOF__
+          cat > ios/DHScreenView.m <<'__DH_EOF__'
+          #import "DHScreenView.h"
+          #import "DHBridge.h"
+          #import <QuartzCore/QuartzCore.h>
+          #import <OpenGLES/EAGL.h>
+          #import <OpenGLES/ES1/gl.h>
+          #import <OpenGLES/ES1/glext.h>
+          #include <string.h>
+          #include <math.h>
+
+          enum { OP_FRAME_END = 0, OP_CLEAR = 1, OP_TEX_IMAGE = 2, OP_TEX_PARAM = 3, OP_TEX_DELETE = 4, OP_DRAW = 5, OP_PIXEL_QUAD = 6 };
+          #define MAX_TEX 4096
+
+          typedef struct {            // mirrors gles.rs gpu_state(), 304 bytes
+              uint32_t flags, bsrc, bdst, tex;
+              int32_t vp[4], sc[4];
+              float proj[16], mv[16], tm[16];
+              uint32_t alphaFunc; float alphaRef;
+              uint32_t depthFunc, cullMode, frontFace, fogMode;
+              float fogDensity, fogStart, fogEnd, fogColor[4];
+              uint32_t texEnv, shade, reserved;
+          } DHState;
+
+          typedef struct {
+              GLuint name;
+              uint32_t w, h;               // size of the image the app uploaded
+              uint32_t minF, magF, wrapS, wrapT;
+              uint8_t *src;                // RGBA copy, kept only when the GPU copy has to be rebuilt (NPOT / oversized)
+          } DHTex;
+
+          static inline uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+          static inline float rdf(const uint8_t *p) { float v; memcpy(&v, p, 4); return v; }
+
+          // Two modes:
+          //  * GPU (default): the Rust core records its GLES calls as an op stream (donuthle_gpu_*); this view replays
+          //    them with the real GPU through OpenGL ES 1.1 (textures, blending, depth, scissor, matrices).
+          //  * Software fallback: the core rasterizes on the CPU and this view just uploads the finished frame.
+          // (software path) GLES 1.1 presenter (every armv7 iOS 7 device has ES1): uploads the core's RGBA8 framebuffer into a
+          // power-of-two texture and draws it as one aspect-fit quad, same approach as the Android native_bridge.
+          @implementation DHScreenView {
+              CADisplayLink *_link;
+              EAGLContext *_ctx;
+              GLuint _fbo, _rbo, _tex;
+              GLint _bw, _bh;               // backing size in pixels
+              uint32_t _fw, _fh;            // core framebuffer size
+              GLsizei _tw, _th;             // texture size (POT)
+              uint8_t *_buf;
+              size_t _bufCap;
+              BOOL _dirtyStorage;
+              // GPU replay
+              GLuint _depthRbo;
+              GLint _maxTex;
+              DHTex *_texs;
+              uint8_t *_ops;
+              size_t _opsCap;
+              float _scale, _rx, _ry;       // virtual->backing scale and letterbox origin (top-left, pixels)
+              uint32_t _vw, _vh;
+              BOOL _needClear;
+          }
+
+          @synthesize gpu = _gpu;
+
+          + (Class)layerClass { return [CAEAGLLayer class]; }
+
+          static GLsizei nextPOT(uint32_t v) { GLsizei r = 1; while ((uint32_t)r < v && r < 4096) r <<= 1; return r; }
+
+          - (instancetype)initWithFrame:(CGRect)f {
+              if ((self = [super initWithFrame:f])) {
+                  self.backgroundColor = [UIColor blackColor];
+                  self.multipleTouchEnabled = NO;
+                  self.contentScaleFactor = [UIScreen mainScreen].scale;
+                  CAEAGLLayer *l = (CAEAGLLayer *)self.layer;
+                  l.opaque = YES;
+                  _gpu = YES;
+                  // Retained: the software renderer's framebuffer persists between frames, so games may not clear.
+                  l.drawableProperties = @{ kEAGLDrawablePropertyRetainedBacking: @YES,
+                                            kEAGLDrawablePropertyColorFormat: kEAGLColorFormatRGBA8 };
+                  _ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES1];
+                  _fw = 320; _fh = 480;
+                  _dirtyStorage = YES;
+                  _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+                  _link.frameInterval = 2; // ~30 fps
+                  [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+                  NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+                  [nc addObserver:self selector:@selector(pause) name:UIApplicationWillResignActiveNotification object:nil];
+                  [nc addObserver:self selector:@selector(resume) name:UIApplicationDidBecomeActiveNotification object:nil];
+              }
+              return self;
+          }
+
+          // GL work in the background gets the process killed, so stop presenting while inactive.
+          - (void)pause  { _link.paused = YES; if (_ctx) { [EAGLContext setCurrentContext:_ctx]; glFinish(); } }
+          - (void)resume { _link.paused = NO; }
+
+          - (void)layoutSubviews { [super layoutSubviews]; _dirtyStorage = YES; }
+
+          - (void)rebuildStorage {
+              [EAGLContext setCurrentContext:_ctx];
+              if (!_fbo) { glGenFramebuffersOES(1, &_fbo); glGenRenderbuffersOES(1, &_rbo); }
+              glBindFramebufferOES(GL_FRAMEBUFFER_OES, _fbo);
+              glBindRenderbufferOES(GL_RENDERBUFFER_OES, _rbo);
+              [_ctx renderbufferStorage:GL_RENDERBUFFER_OES fromDrawable:(CAEAGLLayer *)self.layer];
+              glFramebufferRenderbufferOES(GL_FRAMEBUFFER_OES, GL_COLOR_ATTACHMENT0_OES, GL_RENDERBUFFER_OES, _rbo);
+              glGetRenderbufferParameterivOES(GL_RENDERBUFFER_OES, GL_RENDERBUFFER_WIDTH_OES, &_bw);
+              glGetRenderbufferParameterivOES(GL_RENDERBUFFER_OES, GL_RENDERBUFFER_HEIGHT_OES, &_bh);
+              if (_gpu) {
+                  if (!_depthRbo) glGenRenderbuffersOES(1, &_depthRbo);
+                  glBindRenderbufferOES(GL_RENDERBUFFER_OES, _depthRbo);
+                  const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+                  BOOL d24 = ext && strstr(ext, "GL_OES_depth24");
+                  glRenderbufferStorageOES(GL_RENDERBUFFER_OES, d24 ? GL_DEPTH_COMPONENT24_OES : GL_DEPTH_COMPONENT16_OES, _bw, _bh);
+                  if (!_maxTex) glGetIntegerv(GL_MAX_TEXTURE_SIZE, &_maxTex);
+                  glFramebufferRenderbufferOES(GL_FRAMEBUFFER_OES, GL_DEPTH_ATTACHMENT_OES, GL_RENDERBUFFER_OES, _depthRbo);
+                  glBindRenderbufferOES(GL_RENDERBUFFER_OES, _rbo);
+              }
+              _needClear = YES;
+              _dirtyStorage = NO;
+          }
+
+          - (void)ensureTextureForW:(uint32_t)w h:(uint32_t)h {
+              GLsizei tw = nextPOT(w), th = nextPOT(h);
+              if (_tex && tw == _tw && th == _th) return;
+              if (!_tex) glGenTextures(1, &_tex);
+              glBindTexture(GL_TEXTURE_2D, _tex);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+              _tw = tw; _th = th;
+          }
+
+          - (void)tick:(CADisplayLink *)l {
+              if (!_ctx || self.bounds.size.width < 1) return;
+              if (_gpu) [self tickGPU]; else [self tickSoftware];
+          }
+
+          - (void)tickSoftware {
+              uint32_t w = donuthle_framebuffer_width(), h = donuthle_framebuffer_height();
+              if (w == 0 || h == 0) return;
+              size_t n = (size_t)w * h * 4;
+              if (n > _bufCap) { free(_buf); _buf = malloc(n); _bufCap = _buf ? n : 0; }
+              if (!_buf || donuthle_framebuffer_copy(_buf, n) != n) return;
+              _fw = w; _fh = h;
+
+              [EAGLContext setCurrentContext:_ctx];
+              if (_dirtyStorage) [self rebuildStorage];
+              [self ensureTextureForW:w h:h];
+
+              glBindFramebufferOES(GL_FRAMEBUFFER_OES, _fbo);
+              glViewport(0, 0, _bw, _bh);
+              glClearColor(0, 0, 0, 1);
+              glClear(GL_COLOR_BUFFER_BIT);
+
+              glBindTexture(GL_TEXTURE_2D, _tex);
+              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+              glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, _buf);
+
+              // aspect-fit rect in backing pixels
+              GLfloat s = MIN((GLfloat)_bw / w, (GLfloat)_bh / h);
+              GLfloat qw = w * s, qh = h * s, x0 = (_bw - qw) / 2, y0 = (_bh - qh) / 2;
+              const GLfloat verts[] = { x0, y0, x0 + qw, y0, x0, y0 + qh, x0 + qw, y0 + qh };
+              GLfloat u = (GLfloat)w / _tw, v = (GLfloat)h / _th;
+              const GLfloat uvs[] = { 0, 0, u, 0, 0, v, u, v };
+
+              glMatrixMode(GL_PROJECTION); glLoadIdentity();
+              glOrthof(0, _bw, _bh, 0, -1, 1);   // y down, like the Android shell
+              glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+              glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glDisable(GL_LIGHTING);
+              glEnable(GL_TEXTURE_2D);
+              glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+              glColor4f(1, 1, 1, 1);
+              glEnableClientState(GL_VERTEX_ARRAY);
+              glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+              glVertexPointer(2, GL_FLOAT, 0, verts);
+              glTexCoordPointer(2, GL_FLOAT, 0, uvs);
+              glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+              glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+              glDisableClientState(GL_VERTEX_ARRAY);
+
+              glBindRenderbufferOES(GL_RENDERBUFFER_OES, _rbo);
+              [_ctx presentRenderbuffer:GL_RENDERBUFFER_OES];
+          }
+
+
+          // ---------------------------------------------------------------- GPU replay
+          - (DHTex *)texFor:(uint32_t)i {
+              if (i == 0 || i >= MAX_TEX) i = 0;      // slot 0 is the 1x1 white texture
+              if (!_texs) _texs = calloc(MAX_TEX, sizeof(DHTex));
+              DHTex *t = &_texs[i];
+              if (!t->name) {
+                  glGenTextures(1, &t->name);
+                  glBindTexture(GL_TEXTURE_2D, t->name);
+                  const uint8_t white[4] = { 255, 255, 255, 255 };
+                  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
+                  // same defaults as the software renderer's white_texture()
+                  t->w = t->h = 1; t->minF = t->magF = GL_NEAREST; t->wrapS = t->wrapT = GL_REPEAT;
+                  [self applyParams:t uploadedW:1 uploadedH:1];
+              }
+              return t;
+          }
+
+          static BOOL isPOT(uint32_t v) { return v && !(v & (v - 1)); }
+          static uint32_t nextPOT32(uint32_t v) { uint32_t r = 1; while (r < v) r <<= 1; return r; }
+          static BOOL isMipFilter(uint32_t f) { return f >= 0x2700 && f <= 0x2703; }
+
+          // Nearest or bilinear RGBA resample (used to turn NPOT / oversized images into POT ones).
+          static void resampleRGBA(const uint8_t *src, uint32_t sw, uint32_t sh, uint8_t *dst, uint32_t dw, uint32_t dh, BOOL nearest) {
+              for (uint32_t y = 0; y < dh; y++) {
+                  float fy = (y + 0.5f) * sh / dh - 0.5f;
+                  for (uint32_t x = 0; x < dw; x++) {
+                      float fx = (x + 0.5f) * sw / dw - 0.5f;
+                      uint8_t *o = dst + ((size_t)y * dw + x) * 4;
+                      if (nearest) {
+                          uint32_t sx = MIN(sw - 1, (uint32_t)((x + 0.5f) * sw / dw));
+                          uint32_t sy = MIN(sh - 1, (uint32_t)((y + 0.5f) * sh / dh));
+                          memcpy(o, src + ((size_t)sy * sw + sx) * 4, 4);
+                          continue;
+                      }
+                      int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+                      float tx = fx - x0, ty = fy - y0;
+                      int xa = MAX(0, MIN((int)sw - 1, x0)), xb = MAX(0, MIN((int)sw - 1, x0 + 1));
+                      int ya = MAX(0, MIN((int)sh - 1, y0)), yb = MAX(0, MIN((int)sh - 1, y0 + 1));
+                      const uint8_t *p00 = src + ((size_t)ya * sw + xa) * 4, *p10 = src + ((size_t)ya * sw + xb) * 4;
+                      const uint8_t *p01 = src + ((size_t)yb * sw + xa) * 4, *p11 = src + ((size_t)yb * sw + xb) * 4;
+                      for (int c = 0; c < 4; c++) {
+                          float v = p00[c] * (1 - tx) * (1 - ty) + p10[c] * tx * (1 - ty) + p01[c] * (1 - tx) * ty + p11[c] * tx * ty;
+                          o[c] = (uint8_t)(v + 0.5f);
+                      }
+                  }
+              }
+          }
+
+          // Sampler state for the bound texture, given the size actually uploaded (gw x gh).
+          // ES1 only allows mipmaps and REPEAT on power-of-two textures; NPOT uploads use CLAMP_TO_EDGE and plain filters.
+          - (void)applyParams:(DHTex *)t uploadedW:(uint32_t)gw uploadedH:(uint32_t)gh {
+              BOOL pot = isPOT(gw) && isPOT(gh);
+              GLenum minF = t->minF, magF = t->magF, ws = t->wrapS, wt = t->wrapT;
+              if (!pot) {
+                  if (minF == 0x2700 || minF == 0x2702) minF = GL_NEAREST;
+                  if (minF == 0x2701 || minF == 0x2703) minF = GL_LINEAR;
+                  ws = wt = GL_CLAMP_TO_EDGE;
+              }
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minF);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magF);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ws);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wt);
+          }
+
+          // (Re)creates the GPU image from `pixels` (w x h) honoring the texture's current wrap/filter settings.
+          //  - POT and within GL_MAX_TEXTURE_SIZE: uploaded as is.
+          //  - NPOT with CLAMP_TO_EDGE and no mip filter: uploaded as is (limited-NPOT rules).
+          //  - otherwise (NPOT + REPEAT or mipmaps, or oversized): resampled to POT so wrapping/mipmaps keep working.
+          - (void)uploadTex:(DHTex *)t pixels:(const uint8_t *)pixels {
+              uint32_t w = t->w, h = t->h;
+              BOOL pot = isPOT(w) && isPOT(h), mip = isMipFilter(t->minF);
+              BOOL fits = (GLint)w <= _maxTex && (GLint)h <= _maxTex;
+              BOOL clamped = t->wrapS == GL_CLAMP_TO_EDGE && t->wrapT == GL_CLAMP_TO_EDGE;
+              BOOL asIs = fits && (pot || (clamped && !mip));
+              uint32_t gw = w, gh = h;
+              uint8_t *tmp = NULL;
+              const uint8_t *data = pixels;
+              if (!asIs) {
+                  gw = MIN(nextPOT32(w), (uint32_t)_maxTex); gh = MIN(nextPOT32(h), (uint32_t)_maxTex);
+                  tmp = malloc((size_t)gw * gh * 4);
+                  if (!tmp) return;
+                  resampleRGBA(pixels, w, h, tmp, gw, gh, t->magF == GL_NEAREST);
+                  data = tmp;
+              }
+              glBindTexture(GL_TEXTURE_2D, t->name);
+              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, gw, gh, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+              [self applyParams:t uploadedW:gw uploadedH:gh];
+              if (mip && isPOT(gw) && isPOT(gh)) glGenerateMipmapOES(GL_TEXTURE_2D);
+              free(tmp);
+          }
+
+          - (void)texImage:(const uint8_t *)p {
+              uint32_t id = rd32(p), w = rd32(p + 4), h = rd32(p + 8);
+              if (id == 0 || id >= MAX_TEX || w == 0 || h == 0 || w > 8192 || h > 8192) return;
+              DHTex *t = [self texFor:id];
+              t->w = w; t->h = h;
+              free(t->src); t->src = NULL;
+              BOOL needsRebuild = !(isPOT(w) && isPOT(h)) || (GLint)w > _maxTex || (GLint)h > _maxTex;
+              if (needsRebuild) {                       // keep the source: a later wrap/filter change re-derives the GPU image
+                  t->src = malloc((size_t)w * h * 4);
+                  if (t->src) memcpy(t->src, p + 12, (size_t)w * h * 4);
+              }
+              [self uploadTex:t pixels:p + 12];
+          }
+
+          - (void)texParam:(const uint8_t *)p {
+              uint32_t id = rd32(p), pname = rd32(p + 4), v = rd32(p + 8);
+              if (id == 0 || id >= MAX_TEX) return;
+              DHTex *t = [self texFor:id];
+              uint32_t oldMin = t->minF;
+              switch (pname) {
+                  case 0x2801: t->minF = v; break;
+                  case 0x2800: t->magF = v; break;
+                  case 0x2802: t->wrapS = v; break;
+                  case 0x2803: t->wrapT = v; break;
+                  default: return;
+              }
+              glBindTexture(GL_TEXTURE_2D, t->name);
+              if (t->src) { [self uploadTex:t pixels:t->src]; return; }
+              // POT texture already on the GPU: only the sampler changes (and mipmaps if a mip filter was just turned on)
+              [self applyParams:t uploadedW:t->w uploadedH:t->h];
+              if (isMipFilter(t->minF) && !isMipFilter(oldMin) && isPOT(t->w) && isPOT(t->h)) glGenerateMipmapOES(GL_TEXTURE_2D);
+          }
+
+          - (void)texDelete:(const uint8_t *)p {
+              uint32_t id = rd32(p);
+              if (id == 0 || id >= MAX_TEX || !_texs || !_texs[id].name) return;
+              glDeleteTextures(1, &_texs[id].name);
+              free(_texs[id].src);
+              memset(&_texs[id], 0, sizeof(DHTex));
+          }
+
+          // virtual (top-left origin) rect -> GL window rect (bottom-left origin), clipped to the letterbox
+          - (void)glRectX:(int)x y:(int)y w:(int)w h:(int)h out:(GLint *)o {
+              float bx = _rx + x * _scale, by = _ry + y * _scale, bw = w * _scale, bh = h * _scale;
+              o[0] = (GLint)lroundf(bx); o[2] = (GLint)lroundf(bw);
+              o[3] = (GLint)lroundf(bh); o[1] = _bh - (GLint)lroundf(by + bh);
+          }
+
+          - (void)applyState:(const DHState *)st pixelSpace:(BOOL)px {
+              GLint r[4];
+              [self glRectX:(px ? 0 : st->vp[0]) y:(px ? 0 : st->vp[1]) w:(px ? (int)_vw : st->vp[2]) h:(px ? (int)_vh : st->vp[3]) out:r];
+              glViewport(r[0], r[1], r[2], r[3]);
+
+              GLint lb[4]; [self glRectX:0 y:0 w:(int)_vw h:(int)_vh out:lb];    // letterbox: never draw into the bars
+              GLint sc[4] = { lb[0], lb[1], lb[2], lb[3] };
+              if (st->flags & 4) {
+                  GLint g[4]; [self glRectX:st->sc[0] y:st->sc[1] w:st->sc[2] h:st->sc[3] out:g];
+                  GLint x0 = MAX(lb[0], g[0]), y0 = MAX(lb[1], g[1]);
+                  GLint x1 = MIN(lb[0] + lb[2], g[0] + g[2]), y1 = MIN(lb[1] + lb[3], g[1] + g[3]);
+                  sc[0] = x0; sc[1] = y0; sc[2] = MAX(0, x1 - x0); sc[3] = MAX(0, y1 - y0);
+              }
+              glEnable(GL_SCISSOR_TEST);
+              glScissor(sc[0], sc[1], sc[2], sc[3]);
+
+              if (st->flags & 1) { glEnable(GL_BLEND); glBlendFunc(st->bsrc, st->bdst); } else glDisable(GL_BLEND);
+              if ((st->flags & 2) && !px) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+              glDepthFunc(st->depthFunc);
+              glDepthMask((st->flags & 16) ? GL_TRUE : GL_FALSE);
+              if (st->flags & 32) { glEnable(GL_ALPHA_TEST); glAlphaFunc(st->alphaFunc, st->alphaRef); } else glDisable(GL_ALPHA_TEST);
+              if ((st->flags & 64) && !px) { glEnable(GL_CULL_FACE); glCullFace(st->cullMode); glFrontFace(st->frontFace); }
+              else glDisable(GL_CULL_FACE);
+              if ((st->flags & 128) && !px) {
+                  glEnable(GL_FOG);
+                  glFogf(GL_FOG_MODE, (GLfloat)st->fogMode);
+                  glFogf(GL_FOG_DENSITY, st->fogDensity); glFogf(GL_FOG_START, st->fogStart); glFogf(GL_FOG_END, st->fogEnd);
+                  glFogfv(GL_FOG_COLOR, st->fogColor);
+              } else glDisable(GL_FOG);
+              glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, (GLfloat)st->texEnv);
+              glShadeModel(st->shade);
+              if (st->flags & 8) {
+                  glEnable(GL_TEXTURE_2D);
+                  glBindTexture(GL_TEXTURE_2D, [self texFor:st->tex]->name);
+              } else glDisable(GL_TEXTURE_2D);
+
+              glMatrixMode(GL_PROJECTION);
+              if (px) { glLoadIdentity(); glOrthof(0, _vw, _vh, 0, -1, 1); } else glLoadMatrixf(st->proj);
+              glMatrixMode(GL_TEXTURE);
+              if (px) glLoadIdentity(); else glLoadMatrixf(st->tm);
+              glMatrixMode(GL_MODELVIEW);
+              if (px) glLoadIdentity(); else glLoadMatrixf(st->mv);
+              glPointSize(MAX(1.f, _scale)); glLineWidth(MAX(1.f, _scale));
+          }
+
+          - (void)replayDraw:(const uint8_t *)p {
+              uint32_t mode = rd32(p), count = rd32(p + 4);
+              if (count == 0 || mode > 6) return;
+              DHState st; memcpy(&st, p + 8, sizeof st);
+              const uint8_t *v = p + 8 + sizeof st;
+              [self applyState:&st pixelSpace:NO];
+              glEnableClientState(GL_VERTEX_ARRAY); glEnableClientState(GL_TEXTURE_COORD_ARRAY); glEnableClientState(GL_COLOR_ARRAY);
+              glVertexPointer(3, GL_FLOAT, 24, v);
+              glTexCoordPointer(2, GL_FLOAT, 24, v + 12);
+              glColorPointer(4, GL_UNSIGNED_BYTE, 24, v + 20);
+              glDrawArrays(mode, 0, (GLsizei)count);
+          }
+
+          - (void)replayQuad:(const uint8_t *)p {
+              DHState st; memcpy(&st, p, sizeof st);
+              const uint8_t *q = p + sizeof st;
+              float x = rdf(q), y = rdf(q + 4), w = rdf(q + 8), h = rdf(q + 12);
+              float u0 = rdf(q + 16), v0 = rdf(q + 20), u1 = rdf(q + 24), v1 = rdf(q + 28);
+              const uint8_t *c = q + 32;
+              [self applyState:&st pixelSpace:YES];
+              const GLfloat pos[8] = { x, y, x + w, y, x, y + h, x + w, y + h };
+              const GLfloat uv[8] = { u0, v0, u1, v0, u0, v1, u1, v1 };
+              glDisableClientState(GL_COLOR_ARRAY);
+              glColor4ub(c[0], c[1], c[2], c[3]);
+              glEnableClientState(GL_VERTEX_ARRAY); glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+              glVertexPointer(2, GL_FLOAT, 0, pos);
+              glTexCoordPointer(2, GL_FLOAT, 0, uv);
+              glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+          }
+
+          - (void)replayClear:(const uint8_t *)p {
+              uint32_t mask = rd32(p);
+              const uint8_t *c = p + 4;
+              uint32_t scOn = rd32(p + 8);
+              GLint lb[4]; [self glRectX:0 y:0 w:(int)_vw h:(int)_vh out:lb];
+              GLint sc[4] = { lb[0], lb[1], lb[2], lb[3] };
+              if (scOn) {
+                  GLint g[4]; [self glRectX:(int)rd32(p + 12) y:(int)rd32(p + 16) w:(int)rd32(p + 20) h:(int)rd32(p + 24) out:g];
+                  GLint x0 = MAX(lb[0], g[0]), y0 = MAX(lb[1], g[1]);
+                  GLint x1 = MIN(lb[0] + lb[2], g[0] + g[2]), y1 = MIN(lb[1] + lb[3], g[1] + g[3]);
+                  sc[0] = x0; sc[1] = y0; sc[2] = MAX(0, x1 - x0); sc[3] = MAX(0, y1 - y0);
+              }
+              glEnable(GL_SCISSOR_TEST);
+              glScissor(sc[0], sc[1], sc[2], sc[3]);
+              glDepthMask(GL_TRUE);
+              glClearColor(c[0] / 255.f, c[1] / 255.f, c[2] / 255.f, c[3] / 255.f);
+              glClearDepthf(1.f);
+              GLbitfield m = 0;
+              if (mask & 0x4000) m |= GL_COLOR_BUFFER_BIT;
+              if (mask & 0x0100) m |= GL_DEPTH_BUFFER_BIT;
+              if (m) glClear(m);
+          }
+
+          - (void)tickGPU {
+              size_t pending = donuthle_gpu_pending();
+              if (pending == 0) return;
+              size_t want = pending + pending / 4 + 4096;     // the core may queue another frame meanwhile
+              if (want > _opsCap) { free(_ops); _ops = malloc(want); _opsCap = _ops ? want : 0; }
+              if (!_ops) return;
+              size_t n = donuthle_gpu_take(_ops, _opsCap);
+              if (n == 0) return;
+
+              // find where the newest frame starts: older frames only contribute their texture ops
+              size_t lastStart = 0, prevEnd = 0;
+              for (size_t o = 0; o + 8 <= n;) {
+                  uint32_t op = rd32(_ops + o), len = rd32(_ops + o + 4);
+                  if (o + 8 + len > n) { n = o; break; }       // truncated, ignore the rest
+                  o += 8 + len;
+                  if (op == OP_FRAME_END && len >= 8) {
+                      lastStart = prevEnd; prevEnd = o;
+                      uint32_t w = rd32(_ops + o - len), h = rd32(_ops + o - len + 4);
+                      if (w && h) { _vw = w; _vh = h; _fw = w; _fh = h; }
+                  }
+              }
+              if (prevEnd == 0) return;                         // no complete frame yet
+              n = prevEnd;
+              // NOTE: ops after the last FRAME_END (none, the core publishes whole frames) are discarded.
+
+              [EAGLContext setCurrentContext:_ctx];
+              if (_dirtyStorage) [self rebuildStorage];
+
+              glBindFramebufferOES(GL_FRAMEBUFFER_OES, _fbo);
+              glDisable(GL_CULL_FACE); glDisable(GL_LIGHTING); glDisable(GL_FOG); glDisable(GL_ALPHA_TEST); glDisable(GL_DITHER);
+              glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+
+              _scale = MIN((float)_bw / _vw, (float)_bh / _vh);
+              _rx = (_bw - _vw * _scale) / 2; _ry = (_bh - _vh * _scale) / 2;
+              if (_needClear) {
+                  glDisable(GL_SCISSOR_TEST); glClearColor(0, 0, 0, 1);
+                  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                  _needClear = NO;
+              }
+
+              for (size_t o = 0; o < n;) {
+                  uint32_t op = rd32(_ops + o), len = rd32(_ops + o + 4);
+                  const uint8_t *p = _ops + o + 8;
+                  BOOL older = o < lastStart;
+                  switch (op) {
+                      case OP_TEX_IMAGE:  [self texImage:p]; break;
+                      case OP_TEX_PARAM:  [self texParam:p]; break;
+                      case OP_TEX_DELETE: [self texDelete:p]; break;
+                      default: break;
+                  }
+                  if (!older) {
+                      switch (op) {
+                          case OP_CLEAR: [self replayClear:p]; break;
+                          case OP_DRAW: [self replayDraw:p]; break;
+                          case OP_PIXEL_QUAD: [self replayQuad:p]; break;
+                          default: break;
+                      }
+                  }
+                  o += 8 + len;
+              }
+              glDisableClientState(GL_COLOR_ARRAY); glDisableClientState(GL_TEXTURE_COORD_ARRAY); glDisableClientState(GL_VERTEX_ARRAY);
+              glDisable(GL_SCISSOR_TEST);
+              glBindRenderbufferOES(GL_RENDERBUFFER_OES, _rbo);
+              [_ctx presentRenderbuffer:GL_RENDERBUFFER_OES];
+          }
+
+          - (void)stopPresenting {
+              [_link invalidate]; _link = nil;
+              [[NSNotificationCenter defaultCenter] removeObserver:self];
+              if (_ctx) {
+                  [EAGLContext setCurrentContext:_ctx];
+                  if (_tex) { glDeleteTextures(1, &_tex); _tex = 0; }
+                  if (_fbo) { glDeleteFramebuffersOES(1, &_fbo); _fbo = 0; }
+                  if (_rbo) { glDeleteRenderbuffersOES(1, &_rbo); _rbo = 0; }
+                  if (_depthRbo) { glDeleteRenderbuffersOES(1, &_depthRbo); _depthRbo = 0; }
+                  if (_texs) { for (int i = 0; i < MAX_TEX; i++) { if (_texs[i].name) glDeleteTextures(1, &_texs[i].name); free(_texs[i].src); } free(_texs); _texs = NULL; }
+                  glFinish();
+                  [EAGLContext setCurrentContext:nil];
+                  _ctx = nil;
+              }
+          }
+
+          - (void)dealloc { [self stopPresenting]; free(_buf); free(_ops); }
+
+          // ---- touches: view points -> virtual screen coordinates (aspect-fit) ----
+          - (CGRect)canvasRect {
+              CGSize b = self.bounds.size;
+              CGFloat s = MIN(b.width / _fw, b.height / _fh);
+              CGFloat w = _fw * s, h = _fh * s;
+              return CGRectMake((b.width - w) / 2, (b.height - h) / 2, w, h);
+          }
+
+          - (void)send:(UITouch *)t action:(int)action {
+              if (!self.touchHandler) return;
+              CGPoint pt = [t locationInView:self];
+              CGRect r = [self canvasRect];
+              float x = (float)((pt.x - r.origin.x) * _fw / r.size.width);
+              float y = (float)((pt.y - r.origin.y) * _fh / r.size.height);
+              x = MAX(0.f, MIN(x, (float)_fw - 1.f));
+              y = MAX(0.f, MIN(y, (float)_fh - 1.f));
+              self.touchHandler(action, x, y);
+          }
+          - (void)touchesBegan:(NSSet *)ts withEvent:(UIEvent *)e { [self send:ts.anyObject action:0]; }
+          - (void)touchesMoved:(NSSet *)ts withEvent:(UIEvent *)e { [self send:ts.anyObject action:2]; }
+          - (void)touchesEnded:(NSSet *)ts withEvent:(UIEvent *)e { [self send:ts.anyObject action:1]; }
+          - (void)touchesCancelled:(NSSet *)ts withEvent:(UIEvent *)e { [self send:ts.anyObject action:3]; }
+          @end
+          __DH_EOF__
+          cat > ios/DHShims.c <<'__DH_EOF__'
+          /*
+           * Shims for libSystem symbols that Rust's std may reference but that iOS 7 does not have:
+           *   CCRandomGenerateBytes (iOS 8), clock_gettime / clock_gettime_nsec_np (iOS 10),
+           *   os_unfair_lock_* (iOS 10).
+           * Defining them in the executable makes the static link bind to these instead of the
+           * newer-OS stubs in the SDK, so they never turn into runtime dyld failures on iOS 7.
+           * Do NOT include <time.h> declarations of these from a newer SDK; this is built against SDK 9.3.
+           */
+          #include <stdint.h>
+          #include <stddef.h>
+          #include <stdlib.h>
+          #include <sched.h>
+          #include <time.h>
+          #include <sys/time.h>
+          #include <mach/mach_time.h>
+
+          int32_t CCRandomGenerateBytes(void *bytes, size_t count) {
+              arc4random_buf(bytes, count);
+              return 0; /* kCCSuccess */
+          }
+
+          static uint64_t dh_mach_nsec(void) {
+              static mach_timebase_info_data_t tb;
+              if (tb.denom == 0) mach_timebase_info(&tb);
+              uint64_t t = mach_absolute_time();
+              return (t / tb.denom) * tb.numer + ((t % tb.denom) * tb.numer) / tb.denom;
+          }
+
+          uint64_t clock_gettime_nsec_np(int clk_id) {
+              if (clk_id == 0) { /* CLOCK_REALTIME */
+                  struct timeval tv;
+                  gettimeofday(&tv, NULL);
+                  return (uint64_t)tv.tv_sec * 1000000000ull + (uint64_t)tv.tv_usec * 1000ull;
+              }
+              return dh_mach_nsec(); /* MONOTONIC(6), MONOTONIC_RAW(4), UPTIME_RAW(8), CPU-time clocks */
+          }
+
+          int clock_gettime(int clk_id, struct timespec *ts) {
+              if (!ts) return -1;
+              uint64_t ns = clock_gettime_nsec_np(clk_id);
+              ts->tv_sec = (time_t)(ns / 1000000000ull);
+              ts->tv_nsec = (long)(ns % 1000000000ull);
+              return 0;
+          }
+
+          typedef struct { uint32_t opaque; } dh_unfair_lock;
+
+          void os_unfair_lock_lock(dh_unfair_lock *l) {
+              while (__sync_lock_test_and_set(&l->opaque, 1u)) sched_yield();
+          }
+          int os_unfair_lock_trylock(dh_unfair_lock *l) {
+              return __sync_lock_test_and_set(&l->opaque, 1u) == 0;
+          }
+          void os_unfair_lock_unlock(dh_unfair_lock *l) {
+              __sync_lock_release(&l->opaque);
+          }
+          __DH_EOF__
+          cat > ios/Info.plist <<'__DH_EOF__'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+           <key>CFBundleDevelopmentRegion</key><string>en</string>
+           <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+           <key>CFBundlePackageType</key><string>APPL</string>
+           <key>CFBundleSignature</key><string>????</string>
+           <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
+           <key>LSRequiresIPhoneOS</key><true/>
+           <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+           <key>CFBundleIdentifier</key><string>org.donuthle.ios</string>
+           <key>CFBundleName</key><string>DonutHLE</string>
+           <key>CFBundleDisplayName</key><string>DonutHLE</string>
+           <key>CFBundleExecutable</key><string>DonutHLE</string>
+           <key>CFBundleVersion</key><string>1</string>
+           <key>CFBundleShortVersionString</key><string>0.1.1</string>
+           <key>MinimumOSVersion</key><string>7.0</string>
+           <key>UIRequiredDeviceCapabilities</key><array><string>armv7</string></array>
+           <key>UIFileSharingEnabled</key><true/>
+           <key>UIViewControllerBasedStatusBarAppearance</key><true/>
+           <key>UISupportedInterfaceOrientations</key><array>
+            <string>UIInterfaceOrientationPortrait</string>
+            <string>UIInterfaceOrientationLandscapeLeft</string>
+            <string>UIInterfaceOrientationLandscapeRight</string></array>
+           <key>UTImportedTypeDeclarations</key><array><dict>
+            <key>UTTypeIdentifier</key><string>org.donuthle.apk</string>
+            <key>UTTypeDescription</key><string>Android package</string>
+            <key>UTTypeConformsTo</key><array><string>public.data</string><string>public.archive</string></array>
+            <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>apk</string></array></dict>
+           </dict></array>
+           <key>CFBundleDocumentTypes</key><array><dict>
+            <key>CFBundleTypeName</key><string>Android package</string>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key><array><string>org.donuthle.apk</string></array>
+           </dict></array>
+          </dict></plist>
+          __DH_EOF__
+          cat > ios/Makefile <<'__DH_EOF__'
+          # Theos app, armv7 / iOS 7.0+. Run build-rust-ios.sh first (produces build/lib/libdonuthle.a).
+          export THEOS_DEVICE_IP =
+          ARCHS = armv7
+          TARGET = iphone:clang:9.3:7.0
+          INSTALL_TARGET_PROCESSES = DonutHLE
+          export THEOS ?= /opt/theos
+          include $(THEOS)/makefiles/common.mk
+
+          SDK_ROOT ?= $(THEOS)/sdks/iPhoneOS9.3.sdk
+          DH_LIBS   = $(abspath build/lib)
+
+          APPLICATION_NAME = DonutHLE
+          DonutHLE_FILES = main.m DHAppDelegate.m DHLibraryViewController.m DHGameViewController.m DHScreenView.m DHRunner.m DHShims.c
+          ADDITIONAL_CFLAGS += -O2 -fno-stack-protector -fobjc-arc \
+          	-fno-modules -fno-cxx-modules -fno-implicit-modules -fno-implicit-module-maps \
+          	-Wno-error=objc-property-no-attribute -Wno-error=property-attribute-mismatch
+          DonutHLE_CFLAGS = -DIOS -I$(SDK_ROOT)/usr/include
+          DonutHLE_LDFLAGS = -L$(DH_LIBS) -ldonuthle -lresolv \
+          	-framework UIKit -framework Foundation -framework CoreFoundation -framework QuartzCore \
+          	-framework CoreGraphics -framework OpenGLES -framework Security
+          DonutHLE_CODESIGN_FLAGS =
+          DonutHLE_PLIST = Info.plist
+
+          $(shell chmod 0755 layout/DEBIAN/postinst layout/DEBIAN/postrm 2>/dev/null)
+
+          include $(THEOS_MAKE_PATH)/application.mk
+
+          after-stage::
+          	@cp Info.plist "$(THEOS_STAGING_DIR)/Applications/DonutHLE.app/Info.plist"
+          	@chmod 0755 "$(THEOS_STAGING_DIR)/DEBIAN/postinst" "$(THEOS_STAGING_DIR)/DEBIAN/postrm" 2>/dev/null || true
+          __DH_EOF__
+          cat > ios/build-rust-ios.sh <<'__DH_EOF__'
+          #!/usr/bin/env bash
+          # Builds libdonuthle.a for armv7 / iOS 7.0 (32-bit). Run from anywhere.
+          # Needs: nightly toolchain with rust-src (see RUST_NIGHTLY), a normal stable cargo for lockfile resolution.
+          set -euo pipefail
+          ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+          RUST_NIGHTLY="${RUST_NIGHTLY:-nightly-2024-11-01}"
+          TARGET_JSON="$ROOT/ios/targets/armv7-apple-ios7.json"
+          OUT="$ROOT/ios/build/lib"
+          cd "$ROOT"
+
+          # 32-bit Apple targets are gone from rustc, so std is built from source (-Zbuild-std)
+          # for a hand-written target spec. The checked-in Cargo.lock may need a newer rustc than the pinned
+          # nightly, so re-resolve it against package.rust-version instead.
+          if [ "${KEEP_LOCK:-0}" != "1" ]; then
+            rm -f Cargo.lock
+            cargo +stable generate-lockfile --config 'resolver.incompatible-rust-versions="fallback"'
+          fi
+
+          export CARGO_PROFILE_RELEASE_PANIC=abort
+          export CARGO_PROFILE_RELEASE_OPT_LEVEL=3
+          export CARGO_PROFILE_RELEASE_LTO=off
+          export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
+          export RUSTFLAGS="${RUSTFLAGS:-} -C embed-bitcode=no"
+
+          cargo "+$RUST_NIGHTLY" rustc --release --lib --crate-type staticlib \
+            --target "$TARGET_JSON" \
+            -Z build-std=std,panic_abort \
+            -Z build-std-features=panic_immediate_abort
+
+          mkdir -p "$OUT"
+          cp "target/armv7-apple-ios7/release/libdonuthle.a" "$OUT/"
+          ls -l "$OUT/libdonuthle.a"
+          __DH_EOF__
+          cat > ios/control <<'__DH_EOF__'
+          Package: org.donuthle.ios
+          Name: DonutHLE
+          Version: 0.1.1
+          Architecture: iphoneos-arm
+          Description: Experimental Android 1.x (Dalvik) HLE for 32-bit iOS 7
+          Maintainer: donuthle
+          Author: donuthle
+          Section: Games
+          __DH_EOF__
+          cat > ios/layout/DEBIAN/postinst <<'__DH_EOF__'
+          #!/bin/sh
+          uicache >/dev/null 2>&1 || true
+          exit 0
+          __DH_EOF__
+          cat > ios/layout/DEBIAN/postrm <<'__DH_EOF__'
+          #!/bin/sh
+          uicache >/dev/null 2>&1 || true
+          exit 0
+          __DH_EOF__
+          cat > ios/main.m <<'__DH_EOF__'
+          #import <UIKit/UIKit.h>
+          #import "DHAppDelegate.h"
+          int main(int argc, char *argv[]) {
+              @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass([DHAppDelegate class])); }
+          }
+          __DH_EOF__
+          cat > ios/targets/armv7-apple-ios7.json <<'__DH_EOF__'
+          {
+            "llvm-target": "armv7-apple-ios7.0.0",
+            "arch": "arm",
+            "os": "ios",
+            "vendor": "apple",
+            "data-layout": "e-m:o-p:32:32-Fi8-i64:64-a:0:32-n32-S128",
+            "target-endian": "little",
+            "target-pointer-width": "32",
+            "target-c-int-width": "32",
+            "max-atomic-width": 64,
+            "features": "+v7,+vfp3,+neon",
+            "linker-flavor": "darwin-cc",
+            "is-like-osx": true,
+            "families": ["unix"],
+            "dynamic-linking": true,
+            "executables": true,
+            "dll-suffix": ".dylib",
+            "archive-format": "darwin",
+            "has-rpath": true,
+            "has-thread-local": false,
+            "position-independent-executables": true,
+            "eh-frame-header": false,
+            "function-sections": false,
+            "default-dwarf-version": 2,
+            "emit-debug-gdb-scripts": false,
+            "disable-redzone": true,
+            "panic-strategy": "abort"
+          }
+          __DH_EOF__
+          chmod +x ios/build-rust-ios.sh ios/layout/DEBIAN/postinst ios/layout/DEBIAN/postrm
+          echo "wrote $(find ios -type f | wc -l) files into ios/"
+
+      - name: Patch Rust core (GPU op stream, as_chunks compat, zip features)
+        run: |
+          set -e
+          cat > /tmp/ios7.patch <<'__DH_EOF__'
+          --- a/Cargo.toml
+          +++ b/Cargo.toml
+          @@ -2,6 +2,7 @@
+           name = "donuthle"
+           version = "0.1.1"
+           edition = "2021"
+          +rust-version = "1.82"
+           description = "Experimental high-level emulator for Android 1.x applications"
+           license = "MIT"
+           repository = "https://github.com/KlugKlugTG/DonutHLE"
+          @@ -15,7 +16,8 @@
+           clap = { version = "4", features = ["derive"] }
+           jpeg-decoder = "0.3"
+           png = "0.17"
+          -zip = "2"
+          +# APKs only use stored/deflate; dropping the default features removes the C deps (bzip2, zstd) so cross builds stay pure Rust.
+          +zip = { version = "2", default-features = false, features = ["deflate"] }
+           
+           [dev-dependencies]
+           tempfile = "3"
+          --- a/src/lib.rs
+          +++ b/src/lib.rs
+          @@ -17,6 +17,23 @@
+           pub mod runtime;
+           pub mod vm;
+           
+          +/// `slice::as_chunks` is only stable since Rust 1.88; this keeps the crate building on older toolchains
+          +/// (needed for the hand-built 32-bit iOS 7 target). On newer compilers the inherent method wins.
+          +pub(crate) trait AsChunksCompat<T> {
+          +    fn as_chunks<const N: usize>(&self) -> (&[[T; N]], &[T]);
+          +}
+          +
+          +impl<T> AsChunksCompat<T> for [T] {
+          +    fn as_chunks<const N: usize>(&self) -> (&[[T; N]], &[T]) {
+          +        assert!(N != 0, "chunk size must be non-zero");
+          +        let len = self.len() / N;
+          +        let (head, tail) = self.split_at(len * N);
+          +        // SAFETY: `head` holds exactly `len * N` initialized `T`s and `[T; N]` has the layout of N `T`s.
+          +        let chunks = unsafe { std::slice::from_raw_parts(head.as_ptr().cast::<[T; N]>(), len) };
+          +        (chunks, tail)
+          +    }
+          +}
+          +
+           /// Single host graphics entry point: GLES 1.x is always adapted to the GL2-style renderer.
+           pub type HostGles = gles1_on_gl2::Gles1OnGl2;
+           
+          @@ -121,6 +138,96 @@
+               }
+           }
+           
+          +static GPU_OPS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+          +/// Above this much unconsumed data the queue is compacted (draws of unseen frames are dropped, uploads kept).
+          +const GPU_OPS_SOFT_LIMIT: usize = 8 * 1024 * 1024;
+          +/// Only texture data can still pile up after compaction; refuse frames beyond this.
+          +const GPU_OPS_HARD_LIMIT: usize = 64 * 1024 * 1024;
+          +
+          +/// Drops everything from a queue of whole frames except texture ops, and also uploads that a later upload or
+          +/// delete of the same texture makes redundant. The newest frame (appended afterwards) is untouched.
+          +fn compact_gpu_ops(queue: &mut Vec<u8>) {
+          +    use gles::{GPU_OP_TEX_DELETE, GPU_OP_TEX_IMAGE, GPU_OP_TEX_PARAM};
+          +    let word = |at: usize| u32::from_le_bytes([queue[at], queue[at + 1], queue[at + 2], queue[at + 3]]);
+          +    let mut ops: Vec<(usize, usize, u32)> = Vec::new(); // (start, end, op)
+          +    let mut at = 0;
+          +    while at + 8 <= queue.len() {
+          +        let op = word(at);
+          +        let end = at + 8 + word(at + 4) as usize;
+          +        if end > queue.len() {
+          +            break;
+          +        }
+          +        ops.push((at, end, op));
+          +        at = end;
+          +    }
+          +    let mut last_upload: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+          +    for (index, &(start, _, op)) in ops.iter().enumerate() {
+          +        if (op == GPU_OP_TEX_IMAGE || op == GPU_OP_TEX_DELETE) && start + 12 <= queue.len() {
+          +            last_upload.insert(word(start + 8), index);
+          +        }
+          +    }
+          +    let mut kept = Vec::new();
+          +    for (index, &(start, end, op)) in ops.iter().enumerate() {
+          +        let keep = match op {
+          +            GPU_OP_TEX_PARAM | GPU_OP_TEX_DELETE => true,
+          +            GPU_OP_TEX_IMAGE => last_upload.get(&word(start + 8)) == Some(&index),
+          +            _ => false,
+          +        };
+          +        if keep {
+          +            kept.extend_from_slice(&queue[start..end]);
+          +        }
+          +    }
+          +    *queue = kept;
+          +}
+          +
+          +pub(crate) fn publish_gpu_ops(ops: &[u8]) {
+          +    if let Ok(mut queue) = GPU_OPS.lock() {
+          +        if queue.len() + ops.len() > GPU_OPS_SOFT_LIMIT && !queue.is_empty() {
+          +            compact_gpu_ops(&mut queue);
+          +        }
+          +        if queue.len() + ops.len() <= GPU_OPS_HARD_LIMIT {
+          +            queue.extend_from_slice(ops);
+          +        } else {
+          +            eprintln!("DonutHLE: GPU op queue full, dropping a frame");
+          +        }
+          +    }
+          +}
+          +
+          +/// Switches the next-created runtime to GPU mode (no CPU rasterization; host replays the op stream).
+          +/// Call before `donuthle_launch_report`.
+          +#[no_mangle]
+          +pub extern "C" fn donuthle_gpu_enable(enabled: i32) {
+          +    gles::set_gpu_mode(enabled != 0);
+          +}
+          +
+          +/// Size in bytes of the queued GPU ops (a whole number of frames' worth of ops, ending on FRAME_END).
+          +#[no_mangle]
+          +pub extern "C" fn donuthle_gpu_pending() -> usize {
+          +    GPU_OPS.lock().map(|queue| queue.len()).unwrap_or(0)
+          +}
+          +
+          +/// Moves queued ops into `output` (only if they all fit) and returns the byte count, 0 if nothing or too small.
+          +///
+          +/// # Safety
+          +///
+          +/// `output` must point to a writable buffer of at least `output_len` bytes.
+          +#[no_mangle]
+          +pub unsafe extern "C" fn donuthle_gpu_take(output: *mut u8, output_len: usize) -> usize {
+          +    if output.is_null() {
+          +        return 0;
+          +    }
+          +    let Ok(mut queue) = GPU_OPS.lock() else {
+          +        return 0;
+          +    };
+          +    if queue.is_empty() || queue.len() > output_len {
+          +        return 0;
+          +    }
+          +    let count = queue.len();
+          +    std::ptr::copy_nonoverlapping(queue.as_ptr(), output, count);
+          +    queue.clear();
+          +    count
+          +}
+          +
+           #[no_mangle]
+           pub extern "C" fn donuthle_framebuffer_width() -> u32 {
+               FRAME_SNAPSHOT
+          @@ -201,6 +308,18 @@
+               }
+           }
+           
+          +/// Drops the running session and the published framebuffer (used by hosts that can stop a game, e.g. iOS).
+          +#[no_mangle]
+          +pub extern "C" fn donuthle_stop() {
+          +    clear_framebuffer();
+          +    if let Ok(mut queue) = GPU_OPS.lock() {
+          +        queue.clear();
+          +    }
+          +    if let Ok(mut runtime) = RUNTIME.lock() {
+          +        *runtime = None;
+          +    }
+          +}
+          +
+           #[no_mangle]
+           pub extern "C" fn donuthle_core_info() -> *const std::os::raw::c_char {
+               c"Rust DonutHLE core: Android 1.x APK parsing, AXML, resources, Dalvik VM, framework, GLES, and audio subsystems".as_ptr()
+          --- a/src/gles.rs
+          +++ b/src/gles.rs
+          @@ -1,7 +1,77 @@
+          +#[allow(unused_imports)]
+          +use crate::AsChunksCompat;
+           use std::collections::HashMap;
+          +use std::sync::atomic::{AtomicBool, Ordering};
+           
+           use crate::{Framebuffer, Rgba8, VirtualScreen};
+           
+          +
+          +static GPU_MODE: AtomicBool = AtomicBool::new(false);
+          +
+          +/// When enabled (before the runtime is created), `GlesContext` stops rasterizing on the CPU and instead
+          +/// records a binary op stream that a host with a real GPU (e.g. iOS, OpenGL ES 1.1) replays. See `gpu_ops`.
+          +pub fn set_gpu_mode(enabled: bool) {
+          +    GPU_MODE.store(enabled, Ordering::SeqCst);
+          +}
+          +
+          +pub fn gpu_mode() -> bool {
+          +    GPU_MODE.load(Ordering::SeqCst)
+          +}
+          +
+          +// GPU op stream: every op is [op: u32][payload length in bytes: u32][payload], little endian.
+          +pub const GPU_OP_FRAME_END: u32 = 0; // payload: width u32, height u32
+          +pub const GPU_OP_CLEAR: u32 = 1; // mask, rgba(4 bytes), scissor_on, sx, sy, sw, sh
+          +pub const GPU_OP_TEX_IMAGE: u32 = 2; // id, width, height, width*height*4 RGBA bytes
+          +pub const GPU_OP_TEX_PARAM: u32 = 3; // id, pname, value
+          +pub const GPU_OP_TEX_DELETE: u32 = 4; // id
+          +pub const GPU_OP_DRAW: u32 = 5; // gl_mode, count, STATE, count * (x y z u v f32, rgba 4 bytes)
+          +pub const GPU_OP_PIXEL_QUAD: u32 = 6; // STATE, x y w h u0 v0 u1 v1 (f32), rgba 4 bytes
+          +// STATE: flags (bit0 blend, bit1 depth test, bit2 scissor, bit3 texture2d, bit4 depth mask, bit5 alpha test,
+          +// bit6 cull face, bit7 fog), blend_src,
+          +// blend_dst, bound texture id, viewport x y w h (i32, y from top), scissor x y w h (i32, y from top),
+          +// then projection, modelview, texture matrices (3 x 16 f32, column-major like GL), then 16 words:
+          +// alpha_func, alpha_ref f32, depth_func, cull_mode, front_face, fog_mode, fog_density f32, fog_start f32,
+          +// fog_end f32, fog_color 4 x f32, tex_env_mode, shade_model, reserved. (total STATE size: 304 bytes)
+          +
+          +const ALPHA_TEST: u32 = 0x0BC0;
+          +const CULL_FACE: u32 = 0x0B44;
+          +const FOG: u32 = 0x0B60;
+          +
+          +#[derive(Debug, Clone, Copy)]
+          +struct GpuExtra {
+          +    alpha_func: u32,
+          +    alpha_ref: f32,
+          +    depth_func: u32,
+          +    cull_mode: u32,
+          +    front_face: u32,
+          +    fog_mode: u32,
+          +    fog_density: f32,
+          +    fog_start: f32,
+          +    fog_end: f32,
+          +    fog_color: [f32; 4],
+          +    tex_env_mode: u32,
+          +    shade_model: u32,
+          +}
+          +
+          +impl Default for GpuExtra {
+          +    fn default() -> Self {
+          +        Self {
+          +            alpha_func: 0x0207, // GL_ALWAYS
+          +            alpha_ref: 0.0,
+          +            depth_func: 0x0201, // GL_LESS
+          +            cull_mode: 0x0405,  // GL_BACK
+          +            front_face: 0x0901, // GL_CCW
+          +            fog_mode: 0x0800,   // GL_EXP
+          +            fog_density: 1.0,
+          +            fog_start: 0.0,
+          +            fog_end: 1.0,
+          +            fog_color: [0.0; 4],
+          +            tex_env_mode: 0x2100, // GL_MODULATE
+          +            shade_model: 0x1D01,  // GL_SMOOTH
+          +        }
+          +    }
+          +}
+          +
+           const COLOR_BUFFER_BIT: u32 = 0x4000;
+           const DEPTH_BUFFER_BIT: u32 = 0x0100;
+           const POINTS: u32 = 0x0000;
+          @@ -160,6 +230,9 @@
+               texture_matrix: [f32; 16],
+               matrix_stacks: HashMap<u32, Vec<[f32; 16]>>,
+               next_frame_pixels: usize,
+          +    gpu: bool,
+          +    gpu_ops: Vec<u8>,
+          +    gpu_extra: GpuExtra,
+           }
+           
+           impl Default for GlesContext {
+          @@ -206,9 +279,145 @@
+                       texture_matrix: identity(),
+                       matrix_stacks: HashMap::new(),
+                       next_frame_pixels: 0,
+          +            gpu: gpu_mode(),
+          +            gpu_ops: Vec::new(),
+          +            gpu_extra: GpuExtra::default(),
+                   }
+               }
+           
+          +    pub fn gpu_enabled(&self) -> bool {
+          +        self.gpu
+          +    }
+          +
+          +    /// Takes the ops recorded since the last call (GPU mode only).
+          +    pub fn take_gpu_ops(&mut self) -> Vec<u8> {
+          +        std::mem::take(&mut self.gpu_ops)
+          +    }
+          +
+          +    pub fn finish_gpu_frame(&mut self) {
+          +        let (w, h) = (self.framebuffer.width(), self.framebuffer.height());
+          +        let mut payload = Vec::with_capacity(8);
+          +        payload.extend_from_slice(&w.to_le_bytes());
+          +        payload.extend_from_slice(&h.to_le_bytes());
+          +        self.push_op(GPU_OP_FRAME_END, &payload);
+          +    }
+          +
+          +    fn push_op(&mut self, op: u32, payload: &[u8]) {
+          +        self.gpu_ops.extend_from_slice(&op.to_le_bytes());
+          +        self.gpu_ops
+          +            .extend_from_slice(&(payload.len() as u32).to_le_bytes());
+          +        self.gpu_ops.extend_from_slice(payload);
+          +    }
+          +
+          +    fn gpu_state(&self) -> Vec<u8> {
+          +        let on = |cap: u32| self.enabled.get(&cap).copied().unwrap_or(false);
+          +        let mut flags = 0u32;
+          +        if on(BLEND) {
+          +            flags |= 1;
+          +        }
+          +        if on(DEPTH_TEST) {
+          +            flags |= 2;
+          +        }
+          +        if on(SCISSOR_TEST) {
+          +            flags |= 4;
+          +        }
+          +        if on(TEXTURE_2D) {
+          +            flags |= 8;
+          +        }
+          +        if self.depth_mask_enabled {
+          +            flags |= 16;
+          +        }
+          +        if on(ALPHA_TEST) {
+          +            flags |= 32;
+          +        }
+          +        if on(CULL_FACE) {
+          +            flags |= 64;
+          +        }
+          +        if on(FOG) {
+          +            flags |= 128;
+          +        }
+          +        let scissor = self.scissor.unwrap_or((0, 0, 0, 0));
+          +        let mut out = Vec::with_capacity(304);
+          +        for word in [flags, self.blend_src, self.blend_dst, self.bound_texture] {
+          +            out.extend_from_slice(&word.to_le_bytes());
+          +        }
+          +        for value in [
+          +            self.viewport.0,
+          +            self.viewport.1,
+          +            self.viewport.2 as i32,
+          +            self.viewport.3 as i32,
+          +            scissor.0,
+          +            scissor.1,
+          +            scissor.2 as i32,
+          +            scissor.3 as i32,
+          +        ] {
+          +            out.extend_from_slice(&value.to_le_bytes());
+          +        }
+          +        for matrix in [
+          +            &self.projection_matrix,
+          +            &self.modelview_matrix,
+          +            &self.texture_matrix,
+          +        ] {
+          +            for value in matrix {
+          +                out.extend_from_slice(&value.to_le_bytes());
+          +            }
+          +        }
+          +        let e = &self.gpu_extra;
+          +        for word in [e.alpha_func, e.alpha_ref.to_bits(), e.depth_func, e.cull_mode, e.front_face, e.fog_mode] {
+          +            out.extend_from_slice(&word.to_le_bytes());
+          +        }
+          +        for value in [e.fog_density, e.fog_start, e.fog_end] {
+          +            out.extend_from_slice(&value.to_le_bytes());
+          +        }
+          +        for value in e.fog_color {
+          +            out.extend_from_slice(&value.to_le_bytes());
+          +        }
+          +        for word in [e.tex_env_mode, e.shade_model, 0u32] {
+          +            out.extend_from_slice(&word.to_le_bytes());
+          +        }
+          +        out
+          +    }
+          +
+          +    // ---- fixed-function state that only the GPU path uses (the CPU rasterizer ignores it) ----
+          +    pub fn set_alpha_func(&mut self, func: u32, reference: f32) {
+          +        self.gpu_extra.alpha_func = func;
+          +        self.gpu_extra.alpha_ref = reference.clamp(0.0, 1.0);
+          +    }
+          +
+          +    pub fn set_depth_func(&mut self, func: u32) {
+          +        self.gpu_extra.depth_func = func;
+          +    }
+          +
+          +    pub fn set_cull_face(&mut self, mode: u32) {
+          +        self.gpu_extra.cull_mode = mode;
+          +    }
+          +
+          +    pub fn set_front_face(&mut self, mode: u32) {
+          +        self.gpu_extra.front_face = mode;
+          +    }
+          +
+          +    pub fn set_fog_param(&mut self, pname: u32, value: f32) {
+          +        match pname {
+          +            0x0B65 => self.gpu_extra.fog_mode = value as u32, // GL_FOG_MODE
+          +            0x0B62 => self.gpu_extra.fog_density = value,     // GL_FOG_DENSITY
+          +            0x0B63 => self.gpu_extra.fog_start = value,       // GL_FOG_START
+          +            0x0B64 => self.gpu_extra.fog_end = value,         // GL_FOG_END
+          +            _ => (),
+          +        }
+          +    }
+          +
+          +    pub fn set_fog_color(&mut self, color: [f32; 4]) {
+          +        self.gpu_extra.fog_color = color;
+          +    }
+          +
+          +    pub fn set_tex_env_mode(&mut self, mode: u32) {
+          +        self.gpu_extra.tex_env_mode = mode;
+          +    }
+          +
+          +    pub fn set_shade_model(&mut self, mode: u32) {
+          +        self.gpu_extra.shade_model = mode;
+          +    }
+          +
+               pub fn set_clear_color(&mut self, color: Rgba8) {
+                   self.clear_color = color;
+               }
+          @@ -224,6 +433,21 @@
+               }
+           
+               pub fn clear_mask(&mut self, mask: u32) {
+          +        if self.gpu {
+          +            let c = self.clear_color;
+          +            let scissor_on = self.enabled.get(&SCISSOR_TEST).copied().unwrap_or(false);
+          +            let sc = self.scissor.unwrap_or((0, 0, 0, 0));
+          +            let mut p = Vec::with_capacity(28);
+          +            p.extend_from_slice(&mask.to_le_bytes());
+          +            p.extend_from_slice(&[c.r, c.g, c.b, c.a]);
+          +            p.extend_from_slice(&(scissor_on as u32).to_le_bytes());
+          +            for v in [sc.0, sc.1, sc.2 as i32, sc.3 as i32] {
+          +                p.extend_from_slice(&v.to_le_bytes());
+          +            }
+          +            self.push_op(GPU_OP_CLEAR, &p);
+          +            self.commands.push(GlesCommand::ClearMask(mask));
+          +            return;
+          +        }
+                   if mask & COLOR_BUFFER_BIT != 0 {
+                       self.clear_color_buffer();
+                   }
+          @@ -263,6 +487,9 @@
+               }
+           
+               pub fn delete_texture(&mut self, texture: u32) {
+          +        if self.gpu {
+          +            self.push_op(GPU_OP_TEX_DELETE, &texture.to_le_bytes());
+          +        }
+                   self.textures.remove(&texture);
+                   if self.bound_texture == texture {
+                       self.bound_texture = 0;
+          @@ -286,6 +513,16 @@
+                   for (destination, source) in data.iter_mut().zip(pixels.iter().copied()) {
+                       *destination = source;
+                   }
+          +        if self.gpu {
+          +            let mut p = Vec::with_capacity(12 + data.len() * 4);
+          +            for word in [self.bound_texture, width, height] {
+          +                p.extend_from_slice(&word.to_le_bytes());
+          +            }
+          +            for px in &data {
+          +                p.extend_from_slice(&[px.r, px.g, px.b, px.a]);
+          +            }
+          +            self.push_op(GPU_OP_TEX_IMAGE, &p);
+          +        }
+                   let sampler = self
+                       .textures
+                       .get(&self.bound_texture)
+          @@ -296,7 +533,7 @@
+                       TextureImage {
+                           width,
+                           height,
+          -                pixels: data,
+          +                pixels: if self.gpu { Vec::new() } else { data },
+                           min_filter: sampler.min_filter,
+                           mag_filter: sampler.mag_filter,
+                           wrap_s: sampler.wrap_s,
+          @@ -318,6 +555,13 @@
+                   if target != TEXTURE_2D || self.bound_texture == 0 {
+                       return;
+                   }
+          +        if self.gpu {
+          +            let mut p = Vec::with_capacity(12);
+          +            for word in [self.bound_texture, pname, value] {
+          +                p.extend_from_slice(&word.to_le_bytes());
+          +            }
+          +            self.push_op(GPU_OP_TEX_PARAM, &p);
+          +        }
+                   if let Some(texture) = self.textures.get_mut(&self.bound_texture) {
+                       match pname {
+                           TEXTURE_MIN_FILTER => texture.min_filter = value,
+          @@ -616,7 +860,19 @@
+                           color,
+                       },
+                   ];
+          -        self.rasterize_pixel_quad(x, y, width, height, u0, v0, u1, v1, color);
+          +        if self.gpu {
+          +            let state = self.gpu_state();
+          +            let mut p = Vec::with_capacity(state.len() + 36);
+          +            p.extend_from_slice(&state);
+          +            for f in [x, y, width, height, u0, v0, u1, v1] {
+          +                p.extend_from_slice(&f.to_le_bytes());
+          +            }
+          +            p.extend_from_slice(&[color.r, color.g, color.b, color.a]);
+          +            self.push_op(GPU_OP_PIXEL_QUAD, &p);
+          +            self.next_frame_pixels = self.next_frame_pixels.saturating_add(1);
+          +        } else {
+          +            self.rasterize_pixel_quad(x, y, width, height, u0, v0, u1, v1, color);
+          +        }
+                   self.commands.push(GlesCommand::Draw {
+                       primitive: Primitive::TriangleStrip,
+                       vertices: vertices.to_vec(),
+          @@ -741,6 +997,36 @@
+               }
+           
+               fn draw(&mut self, primitive: Primitive, vertices: &[Vertex]) {
+          +        if self.gpu {
+          +            let mode: u32 = match primitive {
+          +                Primitive::Points => 0,
+          +                Primitive::Lines => 1,
+          +                Primitive::LineLoop => 2,
+          +                Primitive::LineStrip => 3,
+          +                Primitive::Triangles => 4,
+          +                Primitive::TriangleStrip => 5,
+          +                Primitive::TriangleFan => 6,
+          +            };
+          +            let state = self.gpu_state();
+          +            let mut p = Vec::with_capacity(8 + state.len() + vertices.len() * 24);
+          +            p.extend_from_slice(&mode.to_le_bytes());
+          +            p.extend_from_slice(&(vertices.len() as u32).to_le_bytes());
+          +            p.extend_from_slice(&state);
+          +            for v in vertices {
+          +                for f in [v.x, v.y, v.z, v.u, v.v] {
+          +                    p.extend_from_slice(&f.to_le_bytes());
+          +                }
+          +                p.extend_from_slice(&[v.color.r, v.color.g, v.color.b, v.color.a]);
+          +            }
+          +            self.push_op(GPU_OP_DRAW, &p);
+          +            self.next_frame_pixels = self.next_frame_pixels.saturating_add(vertices.len());
+          +            self.commands.push(GlesCommand::DrawArrays {
+          +                mode,
+          +                first: 0,
+          +                count: vertices.len() as i32,
+          +            });
+          +            return;
+          +        }
+                   let command = GlesCommand::Draw {
+                       primitive,
+                       vertices: vertices.to_vec(),
+          --- a/src/runtime.rs
+          +++ b/src/runtime.rs
+          @@ -77,7 +77,13 @@
+                   self.vm
+                       .render_frame(self.listener, method)
+                       .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+          -        crate::publish_framebuffer(self.vm.framework.gles.framebuffer());
+          +        if self.vm.framework.gles.gpu_enabled() {
+          +            self.vm.framework.gles.finish_gpu_frame();
+          +            let ops = self.vm.framework.gles.take_gpu_ops();
+          +            crate::publish_gpu_ops(&ops);
+          +        } else {
+          +            crate::publish_framebuffer(self.vm.framework.gles.framebuffer());
+          +        }
+                   Ok((
+                       self.vm.framework.gles.command_count(),
+                       self.vm.framework.gles.rendered_pixels(),
+          --- a/src/vm.rs
+          +++ b/src/vm.rs
+          @@ -4013,6 +4013,45 @@
+                               .blend_func(int_arg(args, 1)? as u32, int_arg(args, 2)? as u32);
+                           FrameworkResult::Void
+                       }
+          +            ("Lcom/badlogic/gdx/graphics/GLCommon;", "glAlphaFunc")
+          +            | ("Lcom/badlogic/gdx/graphics/GL10;", "glAlphaFunc") => {
+          +                self.framework
+          +                    .gles
+          +                    .set_alpha_func(int_arg(args, 1)? as u32, float_arg(args, 2)?);
+          +                FrameworkResult::Void
+          +            }
+          +            ("Lcom/badlogic/gdx/graphics/GLCommon;", "glDepthFunc")
+          +            | ("Lcom/badlogic/gdx/graphics/GL10;", "glDepthFunc") => {
+          +                self.framework.gles.set_depth_func(int_arg(args, 1)? as u32);
+          +                FrameworkResult::Void
+          +            }
+          +            ("Lcom/badlogic/gdx/graphics/GLCommon;", "glCullFace")
+          +            | ("Lcom/badlogic/gdx/graphics/GL10;", "glCullFace") => {
+          +                self.framework.gles.set_cull_face(int_arg(args, 1)? as u32);
+          +                FrameworkResult::Void
+          +            }
+          +            ("Lcom/badlogic/gdx/graphics/GLCommon;", "glFrontFace")
+          +            | ("Lcom/badlogic/gdx/graphics/GL10;", "glFrontFace") => {
+          +                self.framework.gles.set_front_face(int_arg(args, 1)? as u32);
+          +                FrameworkResult::Void
+          +            }
+          +            ("Lcom/badlogic/gdx/graphics/GL10;", "glFogf") => {
+          +                self.framework
+          +                    .gles
+          +                    .set_fog_param(int_arg(args, 1)? as u32, float_arg(args, 2)?);
+          +                FrameworkResult::Void
+          +            }
+          +            ("Lcom/badlogic/gdx/graphics/GL10;", "glShadeModel") => {
+          +                self.framework.gles.set_shade_model(int_arg(args, 1)? as u32);
+          +                FrameworkResult::Void
+          +            }
+          +            ("Lcom/badlogic/gdx/graphics/GL10;", "glTexEnvf") => {
+          +                // glTexEnvf(target, pname, param): only GL_TEXTURE_ENV_MODE (0x2200) is meaningful here
+          +                if int_arg(args, 2)? == 0x2200 {
+          +                    self.framework.gles.set_tex_env_mode(float_arg(args, 3)? as u32);
+          +                }
+          +                FrameworkResult::Void
+          +            }
+                       ("Lcom/badlogic/gdx/graphics/GLCommon;", "glBindTexture")
+                       | ("Lcom/badlogic/gdx/graphics/GL10;", "glBindTexture") => {
+                           self.framework
+          --- a/src/assets.rs
+          +++ b/src/assets.rs
+          @@ -1,3 +1,5 @@
+          +#[allow(unused_imports)]
+          +use crate::AsChunksCompat;
+           use std::collections::HashMap;
+           use std::io::{Read, Seek};
+           use std::path::Path;
+          --- a/src/manifest.rs
+          +++ b/src/manifest.rs
+          @@ -1,3 +1,5 @@
+          +#[allow(unused_imports)]
+          +use crate::AsChunksCompat;
+           use anyhow::{bail, Context, Result};
+           
+           const RES_XML_TYPE: u16 = 0x0003;
+          --- a/src/resources.rs
+          +++ b/src/resources.rs
+          @@ -1,3 +1,5 @@
+          +#[allow(unused_imports)]
+          +use crate::AsChunksCompat;
+           use anyhow::{bail, Context, Result};
+           
+           const RES_TABLE_TYPE: u16 = 0x0002;
+          __DH_EOF__
+          patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
+          git diff --stat || true
+
+      - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src
+
+      - name: Build libdonuthle.a (armv7 / iOS 7)
+        run: bash ios/build-rust-ios.sh
+
+      - name: Install host tools
+        run: sudo apt-get update && sudo apt-get install -y curl xz-utils bzip2 zip unzip fakeroot make perl
+
+      - name: Install Theos + iOS cross toolchain
+        run: |
+          export THEOS="$GITHUB_WORKSPACE/theos"
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/toolchain/linux/iphone"
+          curl -fsSL "https://github.com/L1ghtmann/llvm-project/releases/download/main-update_3-eabca92/iOSToolchain-x86_64.tar.xz" -o /tmp/ios-toolchain.tar.xz
+          tar -xf /tmp/ios-toolchain.tar.xz -C "$THEOS/toolchain"
+          mkdir -p "$THEOS/sdks"
+          curl -fsSL -o /tmp/sdk.tbz2 "https://raw.githubusercontent.com/Sn0wCooder/theos-sdks/master/iPhoneOS9.3.sdk.tbz2"
+          tar -xjf /tmp/sdk.tbz2 -C "$THEOS/sdks"
+          SDK="$THEOS/sdks/iPhoneOS9.3.sdk"
+          # clang 19 rejects the legacy module.map name
+          for fw in "$SDK"/System/Library/Frameworks/*.framework; do
+            if [ -f "$fw/module.map" ]; then mkdir -p "$fw/Modules"; mv "$fw/module.map" "$fw/Modules/module.modulemap"; fi
+          done
+          find "$SDK/usr/include" -name module.map | while read -r m; do mv "$m" "$(dirname "$m")/module.modulemap"; done
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          echo "SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+      - name: Build .app / .deb via Theos
+        working-directory: ios
+        run: |
+          make clean
+          make package FINALPACKAGE=1 SDK_ROOT="$SDK_ROOT" V=1
+          ls -la packages
+
+      - name: Check binary for symbols iOS 7 does not have
+        run: |
+          BIN="$(find ios/.theos -type f -name DonutHLE -perm -u+x | head -n1)"
+          [ -n "$BIN" ] || { echo "::error::binary not found"; exit 1; }
+          TOOLBIN="$THEOS/toolchain/linux/iphone/bin"
+          NM="$(ls "$TOOLBIN"/llvm-nm 2>/dev/null | head -n1)"; [ -z "$NM" ] && NM="$(command -v llvm-nm || command -v nm)"
+          "$NM" -u "$BIN" > /tmp/undef.txt || true
+          echo "undefined symbols: $(wc -l < /tmp/undef.txt)"
+          # hard failures: these are shimmed in ios/DHShims.c, or break at first use on iOS 7
+          HARD='_CCRandomGenerateBytes|_clock_gettime|_clock_gettime_nsec_np|_os_unfair_lock|___tlv_bootstrap|_getentropy|___isPlatformVersionAtLeast|___isOSVersionAtLeast|___availability_version_check'
+          if grep -E "$HARD" /tmp/undef.txt; then echo "::error::binary imports symbols missing on iOS 7"; exit 1; fi
+          # soft warnings: iOS 8+/10+ libc calls, only fatal if actually reached
+          grep -E '_openat|_fstatat|_fdopendir|_futimens|_utimensat|_timespec_get|_aligned_alloc|_posix_spawn' /tmp/undef.txt && echo "::warning::iOS 8+ libc symbols imported (see list above)" || true
+          if command -v otool >/dev/null 2>&1; then LC="$(otool -l "$BIN")"; else LC="$("$TOOLBIN"/llvm-objdump --macho --private-headers "$BIN" 2>/dev/null || true)"; fi
+          echo "$LC" | grep -E "LC_MAIN|LC_VERSION_MIN|LC_BUILD_VERSION|minos|LC_DYLD_CHAINED_FIXUPS" | head -10 || true
+          if echo "$LC" | grep -E "LC_DYLD_CHAINED_FIXUPS|LC_DYLD_EXPORTS_TRIE"; then echo "::error::linker emitted load commands iOS 7 dyld does not know"; exit 1; fi
+
+      - name: Pack .ipa
+        run: |
+          rm -rf ipa_build; mkdir -p ipa_build/Payload
+          APP="ios/.theos/_/Applications/DonutHLE.app"
+          [ -x "$APP/DonutHLE" ] || { echo "::error::$APP/DonutHLE missing"; exit 1; }
+          cp -a "$APP" ipa_build/Payload/
+          (cd ipa_build && zip -rq "$GITHUB_WORKSPACE/ios/packages/DonutHLE-armv7-iOS7.ipa" Payload)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DonutHLE-iOS7-armv7
+          path: |
+            ios/packages/*.ipa
+            ios/packages/*.deb
