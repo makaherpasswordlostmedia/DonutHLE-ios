@@ -1074,7 +1074,7 @@ jobs:
             "arch": "arm",
             "os": "ios",
             "vendor": "apple",
-            "data-layout": "e-m:o-p:32:32-Fi8-i64:64-a:0:32-n32-S128",
+            "data-layout": "e-m:o-p:32:32-Fi8-f64:32:64-v64:32:64-v128:32:128-a:0:32-n32-S32",
             "target-endian": "little",
             "target-pointer-width": "32",
             "target-c-int-width": "32",
@@ -1082,7 +1082,6 @@ jobs:
             "features": "+v7,+vfp3,+neon",
             "linker-flavor": "darwin-cc",
             "is-like-osx": true,
-            "families": ["unix"],
             "dynamic-linking": true,
             "executables": true,
             "dll-suffix": ".dylib",
@@ -1095,7 +1094,10 @@ jobs:
             "default-dwarf-version": 2,
             "emit-debug-gdb-scripts": false,
             "disable-redzone": true,
-            "panic-strategy": "abort"
+            "panic-strategy": "abort",
+            "target-family": [
+              "unix"
+            ]
           }
           __DH_EOF__
           chmod +x ios/build-rust-ios.sh ios/layout/DEBIAN/postinst ios/layout/DEBIAN/postrm
@@ -1724,7 +1726,6 @@ jobs:
            const RES_TABLE_TYPE: u16 = 0x0002;
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
-          git diff --stat || true
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
