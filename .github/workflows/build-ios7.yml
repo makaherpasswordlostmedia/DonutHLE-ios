@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -2909,6 +2909,43 @@ jobs:
           print('patched Class.newInstance')
           __DH_PY5__
           python3 /tmp/class_fix.py
+          cat > /tmp/clone_fix.py <<'__DH_PY6__'
+          # Object.clone() / array clone (enum values() does $VALUES.clone()).
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'shallow clone for Object.clone' in s:
+              print('clone already patched'); sys.exit(0)
+          a = '''        let framework_class = method.class_name.starts_with("Landroid/")'''
+          b = '''        // shallow clone for Object.clone / array.clone when the app defines no clone() body
+                  if method.name == "clone"
+                      && args.len() == 1
+                      && self.dex.method_code_by_index(method_index).is_none()
+                  {
+                      if let Some(Value::Object(receiver)) = args.first() {
+                          let copy = match self.heap_object(*receiver) {
+                              Some(
+                                  object @ (HeapObject::Array { .. }
+                                  | HeapObject::Instance { .. }
+                                  | HeapObject::Collection(_)
+                                  | HeapObject::Map(_)),
+                              ) => Some(object.clone()),
+                              _ => None,
+                          };
+                          if let Some(copy) = copy {
+                              let id = self.alloc(copy);
+                              return Ok(Value::Object(id));
+                          }
+                      }
+                  }
+          '''
+          if s.count(a) != 1:
+              sys.exit('anchor missing or ambiguous: framework_class (%d)' % s.count(a))
+          s = s.replace(a, b + a, 1)
+          open(p, 'w').write(s)
+          print('patched clone')
+          __DH_PY6__
+          python3 /tmp/clone_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
