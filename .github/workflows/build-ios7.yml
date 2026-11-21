@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -2946,6 +2946,251 @@ jobs:
           print('patched clone')
           __DH_PY6__
           python3 /tmp/clone_fix.py
+          cat > /tmp/rect_fix.py <<'__DH_PY7__'
+          # android.graphics.Rect / RectF methods (width, height, centerX, set, offset, contains, intersect, ...).
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'fn dispatch_rect' in s:
+              print('Rect already patched'); sys.exit(0)
+
+          a = '''        if class_name == "Ljava/util/Locale;" {'''
+          b = '''        if class_name == "Landroid/graphics/Rect;" || class_name == "Landroid/graphics/RectF;" {
+                      return self.dispatch_rect(method_name, args);
+                  }
+          '''
+          if a not in s:
+              sys.exit('anchor missing: locale')
+          s = s.replace(a, b + a, 1)
+
+          a = '''    fn dispatch_gdx(
+                  &mut self,'''
+          b = '''    fn rect_is_float(&self, rect: ObjectId) -> bool {
+                  matches!(
+                      self.heap_object(rect),
+                      Some(HeapObject::Instance { class_name, .. }) if class_name == "Landroid/graphics/RectF;"
+                  )
+              }
+
+              fn rect_values(&self, rect: ObjectId) -> [f32; 4] {
+                  let is_float = self.rect_is_float(rect);
+                  let class_name = if is_float {
+                      "Landroid/graphics/RectF;"
+                  } else {
+                      "Landroid/graphics/Rect;"
+                  };
+                  let suffix = if is_float { "F" } else { "I" };
+                  let mut out = [0.0f32; 4];
+                  if let Some(HeapObject::Instance { fields, .. }) = self.heap_object(rect) {
+                      for (slot, name) in out.iter_mut().zip(["left", "top", "right", "bottom"]) {
+                          let key = format!("{class_name}->{name}:{suffix}");
+                          *slot = match fields.get(&key) {
+                              Some(Value::Int(v)) => *v as f32,
+                              Some(Value::Long(v)) => *v as f32,
+                              Some(Value::Float(v)) => *v,
+                              Some(Value::Double(v)) => *v as f32,
+                              _ => 0.0,
+                          };
+                      }
+                  }
+                  out
+              }
+
+              fn rect_store(&mut self, rect: ObjectId, values: [f32; 4]) {
+                  let is_float = self.rect_is_float(rect);
+                  let class_name = if is_float {
+                      "Landroid/graphics/RectF;"
+                  } else {
+                      "Landroid/graphics/Rect;"
+                  };
+                  let suffix = if is_float { "F" } else { "I" };
+                  for (value, name) in values.into_iter().zip(["left", "top", "right", "bottom"]) {
+                      let stored = if is_float {
+                          Value::Float(value)
+                      } else {
+                          Value::Int(value as i32)
+                      };
+                      self.set_object_field(rect, &format!("{class_name}->{name}:{suffix}"), stored);
+                  }
+              }
+
+              /// android.graphics.Rect / RectF: four fields (left, top, right, bottom) stored as regular instance fields.
+              fn dispatch_rect(&mut self, method_name: &str, args: &[Value]) -> Result<Value, VmError> {
+                  let receiver = object_arg(args, 0)?;
+                  let is_float = self.rect_is_float(receiver);
+                  let number = |vm: &Self, index: usize| -> f32 {
+                      args.get(index)
+                          .map_or(0.0, |value| match vm.resolved_scalar(value) {
+                              Value::Int(v) => v as f32,
+                              Value::Long(v) => v as f32,
+                              Value::Float(v) => v,
+                              Value::Double(v) => v as f32,
+                              _ => 0.0,
+                          })
+                  };
+                  let other = |index: usize| -> Option<ObjectId> {
+                      match args.get(index) {
+                          Some(Value::Object(id)) => Some(*id),
+                          _ => None,
+                      }
+                  };
+                  let [left, top, right, bottom] = self.rect_values(receiver);
+                  let wrap = |value: f32| {
+                      if is_float {
+                          Value::Float(value)
+                      } else {
+                          Value::Int(value as i32)
+                      }
+                  };
+                  let overlap = |a: [f32; 4], b: [f32; 4]| a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+                  Ok(match method_name {
+                      "<init>" => {
+                          let values = if args.len() >= 5 {
+                              [number(self, 1), number(self, 2), number(self, 3), number(self, 4)]
+                          } else if let Some(source) = other(1) {
+                              self.rect_values(source)
+                          } else {
+                              [0.0; 4]
+                          };
+                          self.rect_store(receiver, values);
+                          Value::Void
+                      }
+                      "width" => wrap(right - left),
+                      "height" => wrap(bottom - top),
+                      "centerX" => wrap(if is_float {
+                          (left + right) / 2.0
+                      } else {
+                          (((left + right) as i32) >> 1) as f32
+                      }),
+                      "centerY" => wrap(if is_float {
+                          (top + bottom) / 2.0
+                      } else {
+                          (((top + bottom) as i32) >> 1) as f32
+                      }),
+                      "exactCenterX" => Value::Float((left + right) / 2.0),
+                      "exactCenterY" => Value::Float((top + bottom) / 2.0),
+                      "isEmpty" => Value::Int(i32::from(left >= right || top >= bottom)),
+                      "set" => {
+                          let values = if args.len() >= 5 {
+                              [number(self, 1), number(self, 2), number(self, 3), number(self, 4)]
+                          } else if let Some(source) = other(1) {
+                              self.rect_values(source)
+                          } else {
+                              [left, top, right, bottom]
+                          };
+                          self.rect_store(receiver, values);
+                          Value::Void
+                      }
+                      "setEmpty" => {
+                          self.rect_store(receiver, [0.0; 4]);
+                          Value::Void
+                      }
+                      "offset" => {
+                          let (dx, dy) = (number(self, 1), number(self, 2));
+                          self.rect_store(receiver, [left + dx, top + dy, right + dx, bottom + dy]);
+                          Value::Void
+                      }
+                      "offsetTo" => {
+                          let (x, y) = (number(self, 1), number(self, 2));
+                          self.rect_store(receiver, [x, y, x + (right - left), y + (bottom - top)]);
+                          Value::Void
+                      }
+                      "inset" => {
+                          let (dx, dy) = (number(self, 1), number(self, 2));
+                          self.rect_store(receiver, [left + dx, top + dy, right - dx, bottom - dy]);
+                          Value::Void
+                      }
+                      "contains" => {
+                          let inside = if args.len() >= 5 {
+                              let (l, t, r, b) = (number(self, 1), number(self, 2), number(self, 3), number(self, 4));
+                              left < right && top < bottom && left <= l && top <= t && right >= r && bottom >= b
+                          } else if let Some(source) = other(1) {
+                              let [l, t, r, b] = self.rect_values(source);
+                              left < right && top < bottom && left <= l && top <= t && right >= r && bottom >= b
+                          } else {
+                              let (x, y) = (number(self, 1), number(self, 2));
+                              left < right && top < bottom && x >= left && x < right && y >= top && y < bottom
+                          };
+                          Value::Int(i32::from(inside))
+                      }
+                      "intersects" => {
+                          let hit = if args.len() >= 5 {
+                              overlap(
+                                  [left, top, right, bottom],
+                                  [number(self, 1), number(self, 2), number(self, 3), number(self, 4)],
+                              )
+                          } else if let Some(second) = other(1) {
+                              overlap(self.rect_values(receiver), self.rect_values(second))
+                          } else {
+                              false
+                          };
+                          Value::Int(i32::from(hit))
+                      }
+                      "intersect" => {
+                          let target = if args.len() >= 5 {
+                              [number(self, 1), number(self, 2), number(self, 3), number(self, 4)]
+                          } else if let Some(source) = other(1) {
+                              self.rect_values(source)
+                          } else {
+                              [0.0; 4]
+                          };
+                          let current = [left, top, right, bottom];
+                          let hit = overlap(current, target);
+                          if hit {
+                              self.rect_store(
+                                  receiver,
+                                  [
+                                      left.max(target[0]),
+                                      top.max(target[1]),
+                                      right.min(target[2]),
+                                      bottom.min(target[3]),
+                                  ],
+                              );
+                          }
+                          Value::Int(i32::from(hit))
+                      }
+                      "union" => {
+                          let target = if args.len() >= 5 {
+                              [number(self, 1), number(self, 2), number(self, 3), number(self, 4)]
+                          } else if let Some(source) = other(1) {
+                              self.rect_values(source)
+                          } else {
+                              [0.0; 4]
+                          };
+                          if target[0] < target[2] && target[1] < target[3] {
+                              if left < right && top < bottom {
+                                  self.rect_store(
+                                      receiver,
+                                      [
+                                          left.min(target[0]),
+                                          top.min(target[1]),
+                                          right.max(target[2]),
+                                          bottom.max(target[3]),
+                                      ],
+                                  );
+                              } else {
+                                  self.rect_store(receiver, target);
+                              }
+                          }
+                          Value::Void
+                      }
+                      "equals" => Value::Int(i32::from(
+                          other(1).is_some_and(|second| self.rect_values(second) == [left, top, right, bottom]),
+                      )),
+                      "toString" => Value::String(format!("Rect({left}, {top} - {right}, {bottom})")),
+                      _ => Value::Void,
+                  })
+              }
+
+              fn dispatch_gdx(
+                  &mut self,'''
+          if a not in s:
+              sys.exit('anchor missing: dispatch_gdx')
+          s = s.replace(a, b, 1)
+          open(p, 'w').write(s)
+          print('patched Rect')
+          __DH_PY7__
+          python3 /tmp/rect_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
