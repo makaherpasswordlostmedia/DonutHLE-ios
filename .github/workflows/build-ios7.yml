@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -3230,6 +3230,38 @@ jobs:
           print('patched Typeface')
           __DH_PY8__
           python3 /tmp/typeface_fix.py
+          cat > /tmp/paint_fix.py <<'__DH_PY9__'
+          # android.text.TextPaint is a Paint subclass: route it through the Paint handler, add basic metrics getters.
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'Landroid/text/TextPaint;' in s:
+              print('TextPaint already patched'); sys.exit(0)
+          a = '''        if class_name == "Landroid/graphics/Paint;" {
+                      let receiver = object_arg(args, 0)?;
+                      match method_name {'''
+          b = '''        if class_name == "Landroid/graphics/Paint;" || class_name == "Landroid/text/TextPaint;" {
+                      let receiver = object_arg(args, 0)?;
+                      let text_size = self
+                          .object_field_float(receiver, "text_size")
+                          .unwrap_or(12.0);
+                      match method_name {
+                          "getTextSize" => return Ok(Value::Float(text_size)),
+                          "ascent" => return Ok(Value::Float(-text_size * 0.8)),
+                          "descent" => return Ok(Value::Float(text_size * 0.2)),
+                          "getFontSpacing" => return Ok(Value::Float(text_size * 1.2)),
+                          "getColor" => {
+                              return Ok(Value::Int(
+                                  self.object_field_int(receiver, "color").unwrap_or(-1),
+                              ))
+                          }'''
+          if s.count(a) != 1:
+              sys.exit('anchor missing or ambiguous: Paint (%d)' % s.count(a))
+          s = s.replace(a, b, 1)
+          open(p, 'w').write(s)
+          print('patched TextPaint')
+          __DH_PY9__
+          python3 /tmp/paint_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
