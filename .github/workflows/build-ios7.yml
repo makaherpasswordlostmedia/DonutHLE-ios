@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -3345,6 +3345,238 @@ jobs:
           print('patched Math')
           __DH_PY10__
           python3 /tmp/math_fix.py
+          cat > /tmp/numfmt_fix.py <<'__DH_PY11__'
+          # java.text.NumberFormat: getInstance & friends, fraction digit settings, format() with en_US grouping.
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'fn format_number_text' in s:
+              print('NumberFormat already patched'); sys.exit(0)
+
+          a = '''        if class_name == "Ljava/util/Locale;" {'''
+          b = '''        if class_name == "Ljava/text/NumberFormat;" {
+                      if matches!(
+                          method_name,
+                          "getInstance"
+                              | "getNumberInstance"
+                              | "getIntegerInstance"
+                              | "getPercentInstance"
+                              | "getCurrencyInstance"
+                      ) {
+                          let object = self.alloc_instance("Ljava/text/NumberFormat;");
+                          let max_fraction = match method_name {
+                              "getIntegerInstance" | "getPercentInstance" => 0,
+                              "getCurrencyInstance" => 2,
+                              _ => 3,
+                          };
+                          let min_fraction = if method_name == "getCurrencyInstance" { 2 } else { 0 };
+                          self.set_object_field(object, "max_frac", Value::Int(max_fraction));
+                          self.set_object_field(object, "min_frac", Value::Int(min_fraction));
+                          self.set_object_field(object, "grouping", Value::Int(1));
+                          self.set_object_field(
+                              object,
+                              "percent",
+                              Value::Int(i32::from(method_name == "getPercentInstance")),
+                          );
+                          return Ok(Value::Object(object));
+                      }
+                      let receiver = object_arg(args, 0)?;
+                      let max_fraction = self.object_field_int(receiver, "max_frac").unwrap_or(3);
+                      let min_fraction = self.object_field_int(receiver, "min_frac").unwrap_or(0);
+                      return Ok(match method_name {
+                          "setMaximumFractionDigits" => {
+                              let digits = int_arg(args, 1)?.max(0);
+                              self.set_object_field(receiver, "max_frac", Value::Int(digits));
+                              if min_fraction > digits {
+                                  self.set_object_field(receiver, "min_frac", Value::Int(digits));
+                              }
+                              Value::Void
+                          }
+                          "setMinimumFractionDigits" => {
+                              let digits = int_arg(args, 1)?.max(0);
+                              self.set_object_field(receiver, "min_frac", Value::Int(digits));
+                              if max_fraction < digits {
+                                  self.set_object_field(receiver, "max_frac", Value::Int(digits));
+                              }
+                              Value::Void
+                          }
+                          "setGroupingUsed" => {
+                              self.set_object_field(receiver, "grouping", Value::Int(int_arg(args, 1)?));
+                              Value::Void
+                          }
+                          "getMaximumFractionDigits" => Value::Int(max_fraction),
+                          "getMinimumFractionDigits" => Value::Int(min_fraction),
+                          "format" => {
+                              let mut number = match args.get(1) {
+                                  Some(Value::Int(v)) => *v as f64,
+                                  Some(Value::Long(v)) => *v as f64,
+                                  Some(Value::Float(v)) => *v as f64,
+                                  Some(Value::Double(v)) => *v,
+                                  _ => 0.0,
+                              };
+                              if self.object_field_int(receiver, "percent").unwrap_or(0) != 0 {
+                                  number *= 100.0;
+                              }
+                              let grouping = self.object_field_int(receiver, "grouping").unwrap_or(1) != 0;
+                              Value::String(Self::format_number_text(
+                                  number,
+                                  min_fraction.max(0) as usize,
+                                  max_fraction.max(0) as usize,
+                                  grouping,
+                              ))
+                          }
+                          _ => Value::Void,
+                      });
+                  }
+          '''
+          if a not in s:
+              sys.exit('anchor missing: locale')
+          s = s.replace(a, b + a, 1)
+
+          a = '''    fn dispatch_gdx(
+                  &mut self,'''
+          b = '''    fn format_number_text(value: f64, min_fraction: usize, max_fraction: usize, grouping: bool) -> String {
+                  if value.is_nan() {
+                      return "NaN".to_owned();
+                  }
+                  if value.is_infinite() {
+                      return if value > 0.0 { "\\u{221e}" } else { "-\\u{221e}" }.to_owned();
+                  }
+                  let scale = 10f64.powi(max_fraction.min(15) as i32);
+                  let rounded = (value.abs() * scale).round() / scale;
+                  let text = format!("{:.*}", max_fraction.min(15), rounded);
+                  let (int_part, fraction) = match text.split_once('.') {
+                      Some((int_part, fraction)) => (int_part.to_owned(), fraction.to_owned()),
+                      None => (text.clone(), String::new()),
+                  };
+                  let mut fraction = fraction;
+                  while fraction.len() > min_fraction && fraction.ends_with('0') {
+                      fraction.pop();
+                  }
+                  let mut grouped = String::new();
+                  for (index, digit) in int_part.chars().enumerate() {
+                      if grouping && index > 0 && (int_part.len() - index) % 3 == 0 {
+                          grouped.push(',');
+                      }
+                      grouped.push(digit);
+                  }
+                  let negative = value < 0.0 && rounded != 0.0;
+                  let mut out = String::new();
+                  if negative {
+                      out.push('-');
+                  }
+                  out.push_str(&grouped);
+                  if !fraction.is_empty() {
+                      out.push('.');
+                      out.push_str(&fraction);
+                  }
+                  out
+              }
+
+              fn dispatch_gdx(
+                  &mut self,'''
+          if a not in s:
+              sys.exit('anchor missing: dispatch_gdx')
+          s = s.replace(a, b, 1)
+          open(p, 'w').write(s)
+          print('patched NumberFormat')
+          __DH_PY11__
+          python3 /tmp/numfmt_fix.py
+          cat > /tmp/autostub_fix.py <<'__DH_PY12__'
+          # "Auto stub" mode: unimplemented framework methods return a typed default (and are logged) instead of aborting.
+          # Off by default; toggled from the library screen ("Auto stub: ON/OFF" button, NSUserDefaults key "autostub").
+          import sys, os
+
+          def patch(path, edits, marker):
+              s = open(path).read()
+              if marker in s:
+                  print(path + ': already patched'); return
+              for a, b in edits:
+                  if s.count(a) != 1:
+                      sys.exit('%s: anchor missing or ambiguous (%d): %r' % (path, s.count(a), a[:60]))
+                  s = s.replace(a, b, 1)
+              open(path, 'w').write(s)
+              print(path + ': patched')
+
+          patch('src/vm.rs', [
+              ('pub type ObjectId = u32;\n',
+               'pub type ObjectId = u32;\n\n'
+               'static AUTO_STUB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);\n\n'
+               '/// Auto stub mode: unimplemented framework methods return a default value of their declared type.\n'
+               'pub fn set_auto_stub(enabled: bool) {\n'
+               '    AUTO_STUB.store(enabled, std::sync::atomic::Ordering::Relaxed);\n'
+               '}\n'),
+              ('    set_objects: HashMap<ObjectId, bool>,\n}\n',
+               '    set_objects: HashMap<ObjectId, bool>,\n    /// First char of the shorty of the method being dispatched (return type), used by auto stub.\n    stub_return: char,\n}\n'),
+              ('            set_objects: HashMap::new(),\n        }\n    }\n',
+               "            set_objects: HashMap::new(),\n            stub_return: 'V',\n        }\n    }\n"),
+              ('        let framework_class = method.class_name.starts_with("Landroid/")',
+               "        self.stub_return = method.prototype.chars().next().unwrap_or('V');\n"
+               '        let framework_class = method.class_name.starts_with("Landroid/")'),
+              ('\n        Err(self.error(\n            0,\n            0,\n            format!("framework method {class_name}->{method_name} is not implemented"),\n        ))\n    }\n',
+               '\n        if AUTO_STUB.load(std::sync::atomic::Ordering::Relaxed) {\n'
+               '            self.framework\n'
+               '                .logs\n'
+               '                .push(format!("auto-stub {class_name}->{method_name}"));\n'
+               '            eprintln!("DonutHLE: auto-stub {class_name}->{method_name}");\n'
+               '            return Ok(match self.stub_return {\n'
+               "                'Z' | 'B' | 'S' | 'C' | 'I' => Value::Int(0),\n"
+               "                'J' => Value::Long(0),\n"
+               "                'F' => Value::Float(0.0),\n"
+               "                'D' => Value::Double(0.0),\n"
+               "                'L' => Value::Null,\n"
+               '                _ => Value::Void,\n'
+               '            });\n'
+               '        }\n'
+               '        Err(self.error(\n            0,\n            0,\n            format!("framework method {class_name}->{method_name} is not implemented"),\n        ))\n    }\n'),
+          ], 'static AUTO_STUB')
+
+          patch('src/lib.rs', [
+              ('pub extern "C" fn donuthle_gpu_enable(enabled: i32) {\n    gles::set_gpu_mode(enabled != 0);\n}\n',
+               'pub extern "C" fn donuthle_gpu_enable(enabled: i32) {\n    gles::set_gpu_mode(enabled != 0);\n}\n\n'
+               '/// Auto stub mode: unimplemented framework methods return a default value instead of aborting the launch.\n'
+               '/// Call before `donuthle_launch_report`.\n'
+               '#[no_mangle]\n'
+               'pub extern "C" fn donuthle_set_auto_stub(enabled: i32) {\n'
+               '    vm::set_auto_stub(enabled != 0);\n'
+               '}\n'),
+          ], 'donuthle_set_auto_stub')
+
+          patch('ios/DHBridge.h', [
+              ('void donuthle_gpu_enable(int32_t enabled);\n',
+               'void donuthle_gpu_enable(int32_t enabled);\nvoid donuthle_set_auto_stub(int32_t enabled);\n'),
+          ], 'donuthle_set_auto_stub')
+          patch('ios/DHRunner.h', [
+              ('@property (nonatomic) BOOL gpu; // must be set before -start\n',
+               '@property (nonatomic) BOOL gpu; // must be set before -start\n@property (nonatomic) BOOL autoStub; // must be set before -start\n'),
+          ], 'autoStub')
+          patch('ios/DHRunner.m', [
+              ('        donuthle_gpu_enable(self.gpu ? 1 : 0);\n',
+               '        donuthle_gpu_enable(self.gpu ? 1 : 0);\n        donuthle_set_auto_stub(self.autoStub ? 1 : 0);\n'),
+          ], 'donuthle_set_auto_stub')
+          patch('ios/DHGameViewController.m', [
+              ('    _runner.gpu = gpu;\n',
+               '    _runner.gpu = gpu;\n    _runner.autoStub = [[NSUserDefaults standardUserDefaults] boolForKey:@"autostub"];\n'),
+          ], 'autostub')
+          patch('ios/DHLibraryViewController.m', [
+              ('    self.navigationItem.rightBarButtonItem =\n',
+               '    self.navigationItem.leftBarButtonItem =\n'
+               '        [[UIBarButtonItem alloc] initWithTitle:[self autoStubTitle] style:UIBarButtonItemStylePlain target:self action:@selector(toggleAutoStub)];\n'
+               '    self.navigationItem.rightBarButtonItem =\n'),
+              ('- (void)viewDidLoad {',
+               '- (NSString *)autoStubTitle {\n'
+               '    return [[NSUserDefaults standardUserDefaults] boolForKey:@"autostub"] ? @"Auto stub: ON" : @"Auto stub: OFF";\n'
+               '}\n\n'
+               '- (void)toggleAutoStub {\n'
+               '    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];\n'
+               '    [defaults setBool:![defaults boolForKey:@"autostub"] forKey:@"autostub"];\n'
+               '    [defaults synchronize];\n'
+               '    self.navigationItem.leftBarButtonItem.title = [self autoStubTitle];\n'
+               '}\n\n'
+               '- (void)viewDidLoad {'),
+          ], 'toggleAutoStub')
+          __DH_PY12__
+          python3 /tmp/autostub_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
