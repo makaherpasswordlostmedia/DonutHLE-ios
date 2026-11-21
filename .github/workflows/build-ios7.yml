@@ -1698,6 +1698,51 @@ jobs:
                    Ok((
                        self.vm.framework.gles.command_count(),
                        self.vm.framework.gles.rendered_pixels(),
+          @@ -259,14 +265,36 @@
+                               max_call_depth: 256,
+                           },
+                       );
+          -            let method_index = plan
+          -                .dex
+          -                .methods
+          -                .iter()
+          -                .position(|method| {
+          -                    method.class_name == plan.class_name && method.name == "onCreate"
+          -                })
+          -                .ok_or_else(|| anyhow::anyhow!("launcher onCreate method is missing"))?;
+          +            // `launch_plan` finds onCreate through the superclass chain, so resolve the declaring class the
+          +            // same way (the launcher often inherits it from a base activity that lives in the same dex).
+          +            let method_index = {
+          +                let mut owner = plan.class_name.clone();
+          +                let mut visited = std::collections::BTreeSet::new();
+          +                loop {
+          +                    if let Some(index) = plan
+          +                        .dex
+          +                        .methods
+          +                        .iter()
+          +                        .position(|method| method.class_name == owner && method.name == "onCreate")
+          +                    {
+          +                        break Some(index);
+          +                    }
+          +                    if !visited.insert(owner.clone()) {
+          +                        break None;
+          +                    }
+          +                    match plan
+          +                        .dex
+          +                        .find_class(&owner)
+          +                        .and_then(|class| class.super_class.clone())
+          +                    {
+          +                        Some(parent) => owner = parent,
+          +                        None => break None,
+          +                    }
+          +                }
+          +            }
+          +            .ok_or_else(|| {
+          +                anyhow::anyhow!("launcher onCreate method is missing in {}", plan.class_name)
+          +            })?;
+                       let activity_object = vm.alloc_instance(plan.class_name.clone());
+                       let value = vm
+                           .run_method(
           --- a/src/vm.rs
           +++ b/src/vm.rs
           @@ -1270,7 +1270,7 @@
