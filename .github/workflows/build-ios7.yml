@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle, String, Runtime, AccountManager)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle, String, Runtime, AccountManager, system services)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -3761,6 +3761,67 @@ jobs:
           print('patched AccountManager')
           __DH_PY15__
           python3 /tmp/account_fix.py
+          cat > /tmp/services_fix.py <<'__DH_PY16__'
+          # System services: PowerManager/WakeLock, TelephonyManager (blank identifiers), ConnectivityManager (offline).
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'Landroid/os/PowerManager;' in s:
+              print('system services already patched'); sys.exit(0)
+          a = '''        if class_name == "Ljava/util/Locale;" {'''
+          b = '''        if class_name == "Landroid/os/PowerManager;" {
+                      return Ok(match method_name {
+                          "newWakeLock" => {
+                              Value::Object(self.alloc_instance("Landroid/os/PowerManager$WakeLock;"))
+                          }
+                          "isScreenOn" => Value::Int(1),
+                          _ => Value::Void,
+                      });
+                  }
+                  if class_name == "Landroid/os/PowerManager$WakeLock;" {
+                      return Ok(match method_name {
+                          "isHeld" => Value::Int(0),
+                          _ => Value::Void,
+                      });
+                  }
+                  if class_name == "Landroid/telephony/TelephonyManager;" {
+                      return Ok(match method_name {
+                          "getDeviceId"
+                          | "getSubscriberId"
+                          | "getLine1Number"
+                          | "getSimSerialNumber"
+                          | "getNetworkOperator"
+                          | "getNetworkOperatorName"
+                          | "getSimOperator"
+                          | "getSimOperatorName"
+                          | "getSimCountryIso"
+                          | "getNetworkCountryIso"
+                          | "getDeviceSoftwareVersion" => Value::String(String::new()),
+                          "getSimState" => Value::Int(1),
+                          "getPhoneType" | "getNetworkType" | "getCallState" | "getDataState"
+                          | "getDataActivity" | "isNetworkRoaming" => Value::Int(0),
+                          _ => Value::Void,
+                      });
+                  }
+                  if class_name == "Landroid/net/ConnectivityManager;" {
+                      return Ok(match method_name {
+                          "getActiveNetworkInfo" | "getNetworkInfo" => Value::Null,
+                          "getAllNetworkInfo" => Value::Object(self.alloc(HeapObject::Array {
+                              component: "Landroid/net/NetworkInfo;".to_owned(),
+                              values: Vec::new(),
+                          })),
+                          "getBackgroundDataSetting" => Value::Int(1),
+                          _ => Value::Void,
+                      });
+                  }
+          '''
+          if a not in s:
+              sys.exit('anchor missing: locale')
+          s = s.replace(a, b + a, 1)
+          open(p, 'w').write(s)
+          print('patched system services')
+          __DH_PY16__
+          python3 /tmp/services_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
