@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle, String)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -3577,6 +3577,138 @@ jobs:
           ], 'toggleAutoStub')
           __DH_PY12__
           python3 /tmp/autostub_fix.py
+          cat > /tmp/string_fix.py <<'__DH_PY13__'
+          # java.lang.CharSequence routed to the String handler + common String methods (substring, trim, replace, ...).
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'Ljava/lang/CharSequence;' in s:
+              print('CharSequence already patched'); sys.exit(0)
+
+          a = '''        if class_name == "Ljava/lang/String;" {
+                      let value_of = |value: Option<&Value>| match value {'''
+          b = '''        if class_name == "Ljava/lang/String;" || class_name == "Ljava/lang/CharSequence;" {
+                      let value_of = |value: Option<&Value>| match value {'''
+          if s.count(a) != 1:
+              sys.exit('anchor missing or ambiguous: String head (%d)' % s.count(a))
+          s = s.replace(a, b, 1)
+
+          a = '''                }
+
+                          _ => {}
+                      }
+                  }
+                  if class_name == "Ljava/lang/StringBuilder;" {'''
+          b = '''                }
+                          "substring" | "subSequence" => {
+                              let chars: Vec<char> = value_of(args.first()).chars().collect();
+                              let begin = (int_arg(args, 1)?.max(0) as usize).min(chars.len());
+                              let end = match args.get(2) {
+                                  Some(Value::Int(end)) => (*end).max(0) as usize,
+                                  _ => chars.len(),
+                              }
+                              .min(chars.len())
+                              .max(begin);
+                              let part: String = chars[begin..end].iter().collect();
+                              return Ok(Value::Object(self.alloc_string(part)));
+                          }
+                          "trim" => {
+                              let text = value_of(args.first()).trim().to_owned();
+                              return Ok(Value::Object(self.alloc_string(text)));
+                          }
+                          "toLowerCase" => {
+                              let text = value_of(args.first()).to_lowercase();
+                              return Ok(Value::Object(self.alloc_string(text)));
+                          }
+                          "toUpperCase" => {
+                              let text = value_of(args.first()).to_uppercase();
+                              return Ok(Value::Object(self.alloc_string(text)));
+                          }
+                          "isEmpty" => {
+                              return Ok(Value::Int(i32::from(value_of(args.first()).is_empty())));
+                          }
+                          "replace" => {
+                              let piece = |item: Option<&Value>| match item {
+                                  Some(Value::Int(code)) => char::from_u32(*code as u32)
+                                      .map(|c| c.to_string())
+                                      .unwrap_or_default(),
+                                  other => value_of(other),
+                              };
+                              let value = value_of(args.first());
+                              let from = piece(args.get(1));
+                              let to = piece(args.get(2));
+                              let replaced = if from.is_empty() {
+                                  value
+                              } else {
+                                  value.replace(&from, &to)
+                              };
+                              return Ok(Value::Object(self.alloc_string(replaced)));
+                          }
+                          "lastIndexOf" => {
+                              let value = value_of(args.first());
+                              let needle = match args.get(1) {
+                                  Some(Value::Int(code)) => char::from_u32(*code as u32)
+                                      .map(|c| c.to_string())
+                                      .unwrap_or_default(),
+                                  other => value_of(other),
+                              };
+                              return Ok(Value::Int(
+                                  value.rfind(&needle).map_or(-1, |index| index as i32),
+                              ));
+                          }
+                          "hashCode" => {
+                              return Ok(Value::Int(
+                                  value_of(args.first())
+                                      .encode_utf16()
+                                      .fold(0i32, |hash, unit| {
+                                          hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+                                      }),
+                              ));
+                          }
+                          "compareTo" => {
+                              let left = value_of(args.first());
+                              let right = value_of(args.get(1));
+                              return Ok(Value::Int(match left.cmp(&right) {
+                                  std::cmp::Ordering::Less => -1,
+                                  std::cmp::Ordering::Equal => 0,
+                                  std::cmp::Ordering::Greater => 1,
+                              }));
+                          }
+                          "toCharArray" => {
+                              let values: Vec<Value> = value_of(args.first())
+                                  .chars()
+                                  .map(|c| Value::Int(c as i32))
+                                  .collect();
+                              let array = self.alloc(HeapObject::Array {
+                                  component: "C".to_owned(),
+                                  values,
+                              });
+                              return Ok(Value::Object(array));
+                          }
+                          "getBytes" => {
+                              let values: Vec<Value> = value_of(args.first())
+                                  .bytes()
+                                  .map(|b| Value::Int(i32::from(b as i8)))
+                                  .collect();
+                              let array = self.alloc(HeapObject::Array {
+                                  component: "B".to_owned(),
+                                  values,
+                              });
+                              return Ok(Value::Object(array));
+                          }
+                          "intern" => return Ok(args.first().cloned().unwrap_or(Value::Null)),
+
+                          _ => {}
+                      }
+                  }
+                  if class_name == "Ljava/lang/StringBuilder;" {'''
+          if s.count(a) != 1:
+              sys.exit('anchor missing or ambiguous: String tail (%d)' % s.count(a))
+          s = s.replace(a, b, 1)
+          open(p, 'w').write(s)
+          print('patched CharSequence/String')
+          __DH_PY13__
+          python3 /tmp/string_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
