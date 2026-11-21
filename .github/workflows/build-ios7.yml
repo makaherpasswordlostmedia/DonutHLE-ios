@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle, String)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle, String, Runtime)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -3709,6 +3709,32 @@ jobs:
           print('patched CharSequence/String')
           __DH_PY13__
           python3 /tmp/string_fix.py
+          cat > /tmp/runtime_fix.py <<'__DH_PY14__'
+          # java.lang.Runtime: getRuntime, memory queries, gc, availableProcessors.
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'Ljava/lang/Runtime;' in s:
+              print('Runtime already patched'); sys.exit(0)
+          a = '''        if class_name == "Ljava/util/Locale;" {'''
+          b = '''        if class_name == "Ljava/lang/Runtime;" {
+                      return Ok(match method_name {
+                          "getRuntime" => Value::Object(self.alloc_instance("Ljava/lang/Runtime;")),
+                          "freeMemory" => Value::Long(48 * 1024 * 1024),
+                          "totalMemory" => Value::Long(64 * 1024 * 1024),
+                          "maxMemory" => Value::Long(128 * 1024 * 1024),
+                          "availableProcessors" => Value::Int(1),
+                          _ => Value::Void,
+                      });
+                  }
+          '''
+          if a not in s:
+              sys.exit('anchor missing: locale')
+          s = s.replace(a, b + a, 1)
+          open(p, 'w').write(s)
+          print('patched Runtime')
+          __DH_PY14__
+          python3 /tmp/runtime_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
