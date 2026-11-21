@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -2867,6 +2867,48 @@ jobs:
           print('patched java.io stubs')
           __DH_PY4__
           python3 /tmp/io_fix.py
+          cat > /tmp/class_fix.py <<'__DH_PY5__'
+          # java.lang.Class.newInstance(): allocate the class and run its no-arg constructor.
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'Class.newInstance receiver is not a class' in s:
+              print('Class.newInstance already patched'); sys.exit(0)
+          a = '''        if class_name == "Ljava/lang/Class;" && method_name == "forName" {'''
+          b = '''        if class_name == "Ljava/lang/Class;" && method_name == "newInstance" {
+                      let receiver = object_arg(args, 0)?;
+                      let target = match self.heap_object(receiver) {
+                          Some(HeapObject::Class(descriptor)) => descriptor.clone(),
+                          _ => return Err(self.error(0, 0, "Class.newInstance receiver is not a class")),
+                      };
+                      self.ensure_class_initialized(&target)?;
+                      let object = match target.as_str() {
+                          "Ljava/util/HashMap;" | "Ljava/util/LinkedHashMap;" | "Ljava/util/Hashtable;" => {
+                              self.alloc(HeapObject::Map(Vec::new()))
+                          }
+                          "Ljava/util/ArrayList;" | "Ljava/util/LinkedList;" | "Ljava/util/Vector;" => {
+                              self.alloc(HeapObject::Collection(Vec::new()))
+                          }
+                          _ => self.alloc_instance(target.clone()),
+                      };
+                      let constructor = self.dex.methods.iter().position(|method| {
+                          method.class_name == target
+                              && method.name == "<init>"
+                              && method.prototype == "V()->V"
+                      });
+                      if let Some(constructor) = constructor {
+                          self.run_method(constructor, vec![Value::Object(object)])?;
+                      }
+                      return Ok(Value::Object(object));
+                  }
+          '''
+          if a not in s:
+              sys.exit('anchor missing: Class.forName')
+          s = s.replace(a, b + a, 1)
+          open(p, 'w').write(s)
+          print('patched Class.newInstance')
+          __DH_PY5__
+          python3 /tmp/class_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
