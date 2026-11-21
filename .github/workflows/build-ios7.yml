@@ -1745,7 +1745,37 @@ jobs:
                            .run_method(
           --- a/src/vm.rs
           +++ b/src/vm.rs
-          @@ -1270,7 +1270,7 @@
+          @@ -35,6 +35,15 @@
+               String(String),
+               Class(String),
+               Collection(Vec<Value>),
+          +    /// java.util.HashMap and friends: insertion-ordered key/value pairs (keys compared by Java-ish equality).
+          +    Map(Vec<(Value, Value)>),
+          +    /// Snapshot iterator over a collection / key set / values / entry set.
+          +    Iterator {
+          +        items: Vec<Value>,
+          +        pos: usize,
+          +    },
+          +    /// java.util.Map.Entry
+          +    Pair(Value, Value),
+               StringBuilder(String),
+               Boxed(Value),
+           }
+          @@ -1134,7 +1143,12 @@
+                               })?;
+                               let object = if matches!(
+                                   class_name.as_str(),
+          -                        "Ljava/util/ArrayList;" | "Ljava/util/LinkedList;" | "Ljava/util/HashMap;"
+          +                        "Ljava/util/HashMap;" | "Ljava/util/LinkedHashMap;" | "Ljava/util/Hashtable;"
+          +                    ) {
+          +                        self.alloc(HeapObject::Map(Vec::new()))
+          +                    } else if matches!(
+          +                        class_name.as_str(),
+          +                        "Ljava/util/ArrayList;" | "Ljava/util/LinkedList;"
+                               ) {
+                                   self.alloc(HeapObject::Collection(Vec::new()))
+                               } else {
+          @@ -1270,7 +1284,7 @@
                                    let mut raw = 0u32;
                                    for byte in 0..element_width {
                                        let unit = code.instructions[payload + 4 + (bit_offset + byte) / 2];
@@ -1754,7 +1784,210 @@ jobs:
                                            (unit & 0xff) as u32
                                        } else {
                                            (unit >> 8) as u32
-          @@ -4013,6 +4013,45 @@
+          @@ -2751,17 +2765,29 @@
+                           || class_name == "Ljava/util/ArrayList;"
+                           || class_name == "Ljava/util/LinkedList;"
+                           || class_name == "Ljava/util/HashMap;"
+          +                || class_name == "Ljava/util/LinkedHashMap;"
+          +                || class_name == "Ljava/util/Hashtable;"
+                           || class_name == "Ljava/util/Vector;"
+                           || class_name == "Ljava/lang/StringBuilder;")
+                   {
+                       if class_name == "Ljava/util/ArrayList;"
+                           || class_name == "Ljava/util/LinkedList;"
+                           || class_name == "Ljava/util/HashMap;"
+          +                || class_name == "Ljava/util/LinkedHashMap;"
+          +                || class_name == "Ljava/util/Hashtable;"
+                           || class_name == "Ljava/util/Vector;"
+                       {
+                           if let Some(Value::Object(receiver)) = args.first() {
+                               if (*receiver as usize) < self.heap.len() {
+          -                        self.heap[*receiver as usize] = HeapObject::Collection(Vec::new());
+          +                        let is_map = matches!(
+          +                            class_name,
+          +                            "Ljava/util/HashMap;" | "Ljava/util/LinkedHashMap;" | "Ljava/util/Hashtable;"
+          +                        );
+          +                        self.heap[*receiver as usize] = if is_map {
+          +                            HeapObject::Map(Vec::new())
+          +                        } else {
+          +                            HeapObject::Collection(Vec::new())
+          +                        };
+                               }
+                           }
+                       } else if class_name == "Ljava/lang/StringBuilder;" {
+          @@ -3343,11 +3369,157 @@
+                           _ => {}
+                       }
+                   }
+          +        if matches!(
+          +            class_name,
+          +            "Ljava/util/HashMap;"
+          +                | "Ljava/util/Map;"
+          +                | "Ljava/util/LinkedHashMap;"
+          +                | "Ljava/util/Hashtable;"
+          +                | "Ljava/util/AbstractMap;"
+          +        ) {
+          +            let receiver = match args.first() {
+          +                Some(Value::Object(receiver)) => *receiver,
+          +                _ => self.alloc(HeapObject::Map(Vec::new())),
+          +            };
+          +            let key = args.get(1).cloned().unwrap_or(Value::Null);
+          +            match method_name {
+          +                "size" => {
+          +                    return Ok(Value::Int(match self.heap_object(receiver) {
+          +                        Some(HeapObject::Map(entries)) => entries.len() as i32,
+          +                        _ => 0,
+          +                    }))
+          +                }
+          +                "isEmpty" => {
+          +                    return Ok(Value::Int(match self.heap_object(receiver) {
+          +                        Some(HeapObject::Map(entries)) => i32::from(entries.is_empty()),
+          +                        _ => 1,
+          +                    }))
+          +                }
+          +                "put" => {
+          +                    let value = args.get(2).cloned().unwrap_or(Value::Null);
+          +                    let position = self.map_position(receiver, &key);
+          +                    if let Some(HeapObject::Map(entries)) = self.heap.get_mut(receiver as usize) {
+          +                        return Ok(match position {
+          +                            Some(index) => std::mem::replace(&mut entries[index].1, value),
+          +                            None => {
+          +                                entries.push((key, value));
+          +                                Value::Null
+          +                            }
+          +                        });
+          +                    }
+          +                    return Ok(Value::Null);
+          +                }
+          +                "get" => {
+          +                    let position = self.map_position(receiver, &key);
+          +                    return Ok(match (position, self.heap_object(receiver)) {
+          +                        (Some(index), Some(HeapObject::Map(entries))) => entries[index].1.clone(),
+          +                        _ => Value::Null,
+          +                    });
+          +                }
+          +                "containsKey" => {
+          +                    return Ok(Value::Int(i32::from(self.map_position(receiver, &key).is_some())))
+          +                }
+          +                "containsValue" => {
+          +                    let wanted = self.map_canon(&key);
+          +                    let found = match self.heap_object(receiver) {
+          +                        Some(HeapObject::Map(entries)) => entries
+          +                            .iter()
+          +                            .any(|(_, value)| self.map_canon(value) == wanted),
+          +                        _ => false,
+          +                    };
+          +                    return Ok(Value::Int(i32::from(found)));
+          +                }
+          +                "remove" => {
+          +                    let position = self.map_position(receiver, &key);
+          +                    if let (Some(index), Some(HeapObject::Map(entries))) =
+          +                        (position, self.heap.get_mut(receiver as usize))
+          +                    {
+          +                        return Ok(entries.remove(index).1);
+          +                    }
+          +                    return Ok(Value::Null);
+          +                }
+          +                "clear" => {
+          +                    if let Some(HeapObject::Map(entries)) = self.heap.get_mut(receiver as usize) {
+          +                        entries.clear();
+          +                    }
+          +                    return Ok(Value::Void);
+          +                }
+          +                "putAll" => {
+          +                    let source = match self.heap_object(match key {
+          +                        Value::Object(id) => id,
+          +                        _ => return Ok(Value::Void),
+          +                    }) {
+          +                        Some(HeapObject::Map(entries)) => entries.clone(),
+          +                        _ => Vec::new(),
+          +                    };
+          +                    for (entry_key, entry_value) in source {
+          +                        let position = self.map_position(receiver, &entry_key);
+          +                        if let Some(HeapObject::Map(entries)) = self.heap.get_mut(receiver as usize) {
+          +                            match position {
+          +                                Some(index) => entries[index].1 = entry_value,
+          +                                None => entries.push((entry_key, entry_value)),
+          +                            }
+          +                        }
+          +                    }
+          +                    return Ok(Value::Void);
+          +                }
+          +                "keySet" | "values" | "entrySet" => {
+          +                    let entries = match self.heap_object(receiver) {
+          +                        Some(HeapObject::Map(entries)) => entries.clone(),
+          +                        _ => Vec::new(),
+          +                    };
+          +                    let items: Vec<Value> = match method_name {
+          +                        "keySet" => entries.into_iter().map(|(key, _)| key).collect(),
+          +                        "values" => entries.into_iter().map(|(_, value)| value).collect(),
+          +                        _ => entries
+          +                            .into_iter()
+          +                            .map(|(key, value)| Value::Object(self.alloc(HeapObject::Pair(key, value))))
+          +                            .collect(),
+          +                    };
+          +                    return Ok(Value::Object(self.alloc(HeapObject::Collection(items))));
+          +                }
+          +                _ => return Ok(Value::Void),
+          +            }
+          +        }
+          +        if matches!(
+          +            class_name,
+          +            "Ljava/util/Iterator;" | "Ljava/util/ListIterator;" | "Ljava/util/Enumeration;"
+          +        ) {
+          +            let receiver = object_arg(args, 0)?;
+          +            match method_name {
+          +                "hasNext" | "hasMoreElements" => {
+          +                    return Ok(Value::Int(i32::from(match self.heap_object(receiver) {
+          +                        Some(HeapObject::Iterator { items, pos }) => *pos < items.len(),
+          +                        _ => false,
+          +                    })))
+          +                }
+          +                "next" | "nextElement" => {
+          +                    if let Some(HeapObject::Iterator { items, pos }) =
+          +                        self.heap.get_mut(receiver as usize)
+          +                    {
+          +                        let value = items.get(*pos).cloned().unwrap_or(Value::Null);
+          +                        *pos += 1;
+          +                        return Ok(value);
+          +                    }
+          +                    return Ok(Value::Null);
+          +                }
+          +                _ => return Ok(Value::Void),
+          +            }
+          +        }
+          +        if class_name == "Ljava/util/Map$Entry;" {
+          +            let receiver = object_arg(args, 0)?;
+          +            return Ok(match (method_name, self.heap_object(receiver)) {
+          +                ("getKey", Some(HeapObject::Pair(key, _))) => key.clone(),
+          +                ("getValue", Some(HeapObject::Pair(_, value))) => value.clone(),
+          +                _ => Value::Void,
+          +            });
+          +        }
+                   if class_name == "Ljava/util/ArrayList;"
+                       || class_name == "Ljava/util/LinkedList;"
+                       || class_name == "Ljava/util/HashMap;"
+                       || class_name == "Ljava/util/Vector;"
+                       || class_name == "Ljava/util/Collection;"
+          +            || class_name == "Ljava/util/Set;"
+                       || class_name == "Ljava/util/List;"
+                       || class_name == "Ljava/util/AbstractList;"
+                       || class_name == "Ljava/util/AbstractCollection;"
+          @@ -3398,6 +3570,13 @@
+                               }
+                               return Ok(Value::Void);
+                           }
+          +                "iterator" | "listIterator" | "elements" => {
+          +                    let items = match self.heap_object(receiver) {
+          +                        Some(HeapObject::Collection(values)) => values.clone(),
+          +                        _ => Vec::new(),
+          +                    };
+          +                    return Ok(Value::Object(self.alloc(HeapObject::Iterator { items, pos: 0 })));
+          +                }
+                           _ => return Ok(Value::Void),
+                       }
+                   }
+          @@ -4013,6 +4192,45 @@
                                .blend_func(int_arg(args, 1)? as u32, int_arg(args, 2)? as u32);
                            FrameworkResult::Void
                        }
@@ -1800,7 +2033,7 @@ jobs:
                        ("Lcom/badlogic/gdx/graphics/GLCommon;", "glBindTexture")
                        | ("Lcom/badlogic/gdx/graphics/GL10;", "glBindTexture") => {
                            self.framework
-          @@ -4114,7 +4153,7 @@
+          @@ -4114,7 +4332,7 @@
                            FrameworkResult::Int(value as i32)
                        }
                        ("Lcom/badlogic/gdx/math/MathUtils;", "randomBoolean") => {
@@ -1809,6 +2042,36 @@ jobs:
                        }
                        ("Lcom/badlogic/gdx/math/MathUtils;", "round") => {
                            FrameworkResult::Int(float_arg(args, 0)?.round() as i32)
+          @@ -4619,6 +4837,29 @@
+                       _ => None,
+                   }
+               }
+          +
+          +    /// Key normalisation for java.util.Map: string objects compare by content, boxed numbers by value,
+          +    /// everything else by identity.
+          +    fn map_canon(&self, value: &Value) -> Value {
+          +        match value {
+          +            Value::Object(id) => match self.heap_object(*id) {
+          +                Some(HeapObject::String(text)) => Value::String(text.clone()),
+          +                Some(HeapObject::Boxed(inner)) => inner.clone(),
+          +                _ => value.clone(),
+          +            },
+          +            _ => value.clone(),
+          +        }
+          +    }
+          +
+          +    fn map_position(&self, receiver: ObjectId, key: &Value) -> Option<usize> {
+          +        let key = self.map_canon(key);
+          +        match self.heap_object(receiver) {
+          +            Some(HeapObject::Map(entries)) => entries
+          +                .iter()
+          +                .position(|(existing, _)| self.map_canon(existing) == key),
+          +            _ => None,
+          +        }
+          +    }
+           
+               fn alloc(&mut self, object: HeapObject) -> ObjectId {
+                   let id = self.heap.len() as ObjectId;
           --- a/src/assets.rs
           +++ b/src/assets.rs
           @@ -1,3 +1,5 @@
