@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (android.preference.PreferenceManager + SharedPreferences fixes)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware method lookup)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -2596,6 +2596,49 @@ jobs:
           print('patched vm.rs')
           __DH_PY__
           python3 /tmp/prefs_fix.py
+          cat > /tmp/proto_fix.py <<'__DH_PY2__'
+          # method_code_by_index fell back to a name-only lookup, so obfuscated overloads (a/b/c...) resolved to the wrong prototype.
+          p2 = 'src/dalvik.rs'
+          d = open(p2).read()
+          if 'fn method_code_matching_prototype' not in d:
+              old = '''        encoded
+                      .and_then(|method| method.code.as_ref())
+                      .or_else(|| self.method_code(&method.class_name, &method.name))
+              }
+          '''
+              new = '''        encoded
+                      .and_then(|method| method.code.as_ref())
+                      .or_else(|| self.method_code_matching_prototype(method))
+              }
+
+              /// Walks the superclass chain looking for a method with the same name AND prototype.
+              fn method_code_matching_prototype(&self, wanted: &MethodId) -> Option<&CodeItem> {
+                  let mut class_name = wanted.class_name.as_str();
+                  let mut visited = std::collections::BTreeSet::new();
+                  while visited.insert(class_name.to_owned()) {
+                      let class = self.find_class(class_name)?;
+                      for encoded in class.direct_methods.iter().chain(class.virtual_methods.iter()) {
+                          if let (Some(id), Some(code)) =
+                              (self.methods.get(encoded.method_index as usize), encoded.code.as_ref())
+                          {
+                              if id.name == wanted.name && id.prototype == wanted.prototype {
+                                  return Some(code);
+                              }
+                          }
+                      }
+                      class_name = class.super_class.as_deref()?;
+                  }
+                  None
+              }
+          '''
+              if old not in d:
+                  raise SystemExit('anchor missing: method_code_by_index')
+              open(p2, 'w').write(d.replace(old, new, 1))
+              print('patched dalvik.rs')
+          else:
+              print('dalvik.rs already patched')
+          __DH_PY2__
+          python3 /tmp/proto_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
