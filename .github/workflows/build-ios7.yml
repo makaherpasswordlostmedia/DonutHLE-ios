@@ -1812,7 +1812,24 @@ jobs:
                                            (unit & 0xff) as u32
                                        } else {
                                            (unit >> 8) as u32
-          @@ -2215,6 +2229,14 @@
+          @@ -2185,7 +2199,15 @@
+                   }
+                   if class_name == "Landroid/os/Environment;" && method_name == "getExternalStorageDirectory"
+                   {
+          -            return Ok(Value::Object(self.alloc_instance("Ljava/io/File;")));
+          +            return Ok(Value::Object(self.alloc_file("/sdcard")));
+          +        }
+          +        if class_name == "Landroid/os/Environment;" && method_name == "getExternalStorageState" {
+          +            return Ok(Value::String("mounted".to_owned()));
+          +        }
+          +        if class_name == "Landroid/content/Context;" || class_name.starts_with("Landroid/app/") {
+          +            if let Some(value) = self.context_directory(method_name, args) {
+          +                return Ok(value);
+          +            }
+                   }
+                   if class_name == "Landroid/content/Context;" || class_name.starts_with("Landroid/app/") {
+                       match method_name {
+          @@ -2215,6 +2237,14 @@
                                    });
                                return Ok(Value::Object(object));
                            }
@@ -1827,7 +1844,7 @@ jobs:
                            "getSharedPreferences" => {
                                let prefs = self.alloc_instance("Landroid/content/SharedPreferences;");
                                self.set_object_field(
-          @@ -2751,17 +2773,29 @@
+          @@ -2751,17 +2781,29 @@
                            || class_name == "Ljava/util/ArrayList;"
                            || class_name == "Ljava/util/LinkedList;"
                            || class_name == "Ljava/util/HashMap;"
@@ -1858,10 +1875,13 @@ jobs:
                                }
                            }
                        } else if class_name == "Ljava/lang/StringBuilder;" {
-          @@ -2979,9 +3013,59 @@
-                   {
-                       return Ok(Value::Object(self.alloc_instance("Ljava/io/File;")));
+          @@ -2977,11 +3019,61 @@
                    }
+                   if class_name == "Landroid/os/Environment;" && method_name == "getExternalStorageDirectory"
+                   {
+          -            return Ok(Value::Object(self.alloc_instance("Ljava/io/File;")));
+          +            return Ok(Value::Object(self.alloc_file("/sdcard")));
+          +        }
           +        if class_name == "Landroid/content/pm/PackageManager;" {
           +            return match method_name {
           +                "getPackageInfo" => {
@@ -1899,7 +1919,7 @@ jobs:
           +                )),
           +                _ => Ok(Value::Void),
           +            };
-          +        }
+                   }
                    if class_name == "Landroid/content/Context;" || class_name.starts_with("Landroid/app/") {
                        return match method_name {
                            "getApplicationContext" => object_arg(args, 0).map(Value::Object),
@@ -1918,7 +1938,119 @@ jobs:
                            "getResources" => Ok(Value::Object(
                                self.alloc_instance("Landroid/content/res/Resources;"),
                            )),
-          @@ -3343,11 +3427,157 @@
+          @@ -3174,22 +3266,107 @@
+                   }
+                   if class_name == "Ljava/io/File;" {
+                       let receiver = object_arg(args, 0)?;
+          +            if method_name == "<init>" {
+          +                let path = match (args.get(1), args.get(2)) {
+          +                    (Some(parent), Some(child)) => {
+          +                        join_path(&self.file_path_value(parent), &self.file_path_value(child))
+          +                    }
+          +                    (Some(path), None) => self.file_path_value(path),
+          +                    _ => String::new(),
+          +                };
+          +                self.set_object_field(receiver, "path", Value::String(path));
+          +                return Ok(Value::Void);
+          +            }
+                       let path = self
+                           .object_field_string(receiver, "path")
+                           .unwrap_or_default();
+          +            let prefix = format!("{}/", path.trim_end_matches('/'));
+          +            let is_file = self.framework.files.contains_key(&path);
+          +            let is_dir = self.framework.directories.contains(&path)
+          +                || self.framework.files.keys().any(|key| key.starts_with(&prefix));
+          +            let children = || -> std::collections::BTreeSet<String> {
+          +                let mut names = std::collections::BTreeSet::new();
+          +                for key in self
+          +                    .framework
+          +                    .files
+          +                    .keys()
+          +                    .chain(self.framework.directories.iter())
+          +                {
+          +                    if let Some(rest) = key.strip_prefix(&prefix) {
+          +                        if let Some(name) = rest.split('/').next().filter(|name| !name.is_empty()) {
+          +                            names.insert(name.to_owned());
+          +                        }
+          +                    }
+          +                }
+          +                names
+          +            };
+                       return Ok(match method_name {
+          -                "exists" => Value::Int(i32::from(self.framework.files.contains_key(&path))),
+          +                "exists" => Value::Int(i32::from(is_file || is_dir)),
+          +                "isFile" => Value::Int(i32::from(is_file)),
+          +                "isDirectory" => Value::Int(i32::from(is_dir)),
+                           "length" => Value::Long(
+                               self.framework
+                                   .files
+                                   .get(&path)
+                                   .map_or(0, |data| data.len() as i64),
+                           ),
+          -                "delete" => Value::Int(i32::from(self.framework.files.remove(&path).is_some())),
+          -                "isFile" => Value::Int(i32::from(self.framework.files.contains_key(&path))),
+          -                "getPath" | "getAbsolutePath" | "toString" => {
+          +                "delete" => {
+          +                    let removed_file = self.framework.files.remove(&path).is_some();
+          +                    let removed_dir = self.framework.directories.remove(&path);
+          +                    Value::Int(i32::from(removed_file || removed_dir))
+          +                }
+          +                "mkdir" | "mkdirs" => {
+          +                    let mut current = String::new();
+          +                    for part in path.split('/').filter(|part| !part.is_empty()) {
+          +                        current.push('/');
+          +                        current.push_str(part);
+          +                        self.framework.directories.insert(current.clone());
+          +                    }
+          +                    Value::Int(1)
+          +                }
+          +                "createNewFile" => {
+          +                    let created = !is_file;
+          +                    self.framework.files.entry(path).or_default();
+          +                    Value::Int(i32::from(created))
+          +                }
+          +                "canRead" | "canWrite" => Value::Int(1),
+          +                "lastModified" => Value::Long(0),
+          +                "getPath" | "getAbsolutePath" | "getCanonicalPath" | "toString" => {
+                               Value::Object(self.alloc_string(path))
+                           }
+          +                "getName" => Value::Object(
+          +                    self.alloc_string(path.rsplit('/').next().unwrap_or_default().to_owned()),
+          +                ),
+          +                "getParent" => match path.rfind('/') {
+          +                    Some(0) => Value::Object(self.alloc_string("/")),
+          +                    Some(index) => Value::Object(self.alloc_string(path[..index].to_owned())),
+          +                    None => Value::Null,
+          +                },
+          +                "getParentFile" => match path.rfind('/') {
+          +                    Some(0) => Value::Object(self.alloc_file("/")),
+          +                    Some(index) => Value::Object(self.alloc_file(path[..index].to_owned())),
+          +                    None => Value::Null,
+          +                },
+          +                "list" | "listFiles" => {
+          +                    let names = children();
+          +                    let as_files = method_name == "listFiles";
+          +                    let mut values = Vec::new();
+          +                    for name in names {
+          +                        values.push(Value::Object(if as_files {
+          +                            self.alloc_file(format!("{prefix}{name}"))
+          +                        } else {
+          +                            self.alloc_string(name)
+          +                        }));
+          +                    }
+          +                    Value::Object(self.alloc(HeapObject::Array {
+          +                        component: if as_files {
+          +                            "Ljava/io/File;".to_owned()
+          +                        } else {
+          +                            "Ljava/lang/String;".to_owned()
+          +                        },
+          +                        values,
+          +                    }))
+          +                }
+                           _ => Value::Void,
+                       });
+                   }
+          @@ -3343,11 +3520,157 @@
                            _ => {}
                        }
                    }
@@ -2076,7 +2208,7 @@ jobs:
                        || class_name == "Ljava/util/List;"
                        || class_name == "Ljava/util/AbstractList;"
                        || class_name == "Ljava/util/AbstractCollection;"
-          @@ -3398,6 +3628,13 @@
+          @@ -3398,6 +3721,13 @@
                                }
                                return Ok(Value::Void);
                            }
@@ -2090,7 +2222,7 @@ jobs:
                            _ => return Ok(Value::Void),
                        }
                    }
-          @@ -4013,6 +4250,45 @@
+          @@ -4013,6 +4343,45 @@
                                .blend_func(int_arg(args, 1)? as u32, int_arg(args, 2)? as u32);
                            FrameworkResult::Void
                        }
@@ -2136,7 +2268,7 @@ jobs:
                        ("Lcom/badlogic/gdx/graphics/GLCommon;", "glBindTexture")
                        | ("Lcom/badlogic/gdx/graphics/GL10;", "glBindTexture") => {
                            self.framework
-          @@ -4114,7 +4390,7 @@
+          @@ -4114,7 +4483,7 @@
                            FrameworkResult::Int(value as i32)
                        }
                        ("Lcom/badlogic/gdx/math/MathUtils;", "randomBoolean") => {
@@ -2145,13 +2277,67 @@ jobs:
                        }
                        ("Lcom/badlogic/gdx/math/MathUtils;", "round") => {
                            FrameworkResult::Int(float_arg(args, 0)?.round() as i32)
-          @@ -4619,6 +4895,29 @@
-                       _ => None,
+          @@ -4620,6 +4989,84 @@
                    }
                }
-          +
+           
           +    /// Key normalisation for java.util.Map: string objects compare by content, boxed numbers by value,
           +    /// everything else by identity.
+          +    fn alloc_file(&mut self, path: impl Into<String>) -> ObjectId {
+          +        let file = self.alloc_instance("Ljava/io/File;");
+          +        self.set_object_field(file, "path", Value::String(path.into()));
+          +        file
+          +    }
+          +
+          +    fn file_path_value(&self, value: &Value) -> String {
+          +        match value {
+          +            Value::String(text) => text.clone(),
+          +            Value::Object(id) => match self.heap_object(*id) {
+          +                Some(HeapObject::String(text)) => text.clone(),
+          +                Some(HeapObject::Instance { .. }) => {
+          +                    self.object_field_string(*id, "path").unwrap_or_default()
+          +                }
+          +                _ => String::new(),
+          +            },
+          +            _ => String::new(),
+          +        }
+          +    }
+          +
+          +    /// Context.getFilesDir() and friends, backed by the in-memory file system.
+          +    fn context_directory(&mut self, method_name: &str, args: &[Value]) -> Option<Value> {
+          +        let package = self.framework.package_name.clone();
+          +        let path = match method_name {
+          +            "getFilesDir" => format!("/data/data/{package}/files"),
+          +            "getCacheDir" => format!("/data/data/{package}/cache"),
+          +            "getExternalCacheDir" => format!("/sdcard/Android/data/{package}/cache"),
+          +            "getExternalFilesDir" => match self.string_arg(args, 1).ok().filter(|text| !text.is_empty()) {
+          +                Some(sub) => format!("/sdcard/Android/data/{package}/files/{sub}"),
+          +                None => format!("/sdcard/Android/data/{package}/files"),
+          +            },
+          +            "getObbDir" => format!("/sdcard/Android/obb/{package}"),
+          +            "getDir" => format!(
+          +                "/data/data/{package}/app_{}",
+          +                self.string_arg(args, 1).unwrap_or_default()
+          +            ),
+          +            "getDatabasePath" => {
+          +                let name = self.string_arg(args, 1).unwrap_or_default();
+          +                let path = format!("/data/data/{package}/databases/{name}");
+          +                return Some(Value::Object(self.alloc_file(path)));
+          +            }
+          +            "getPackageCodePath" | "getPackageResourcePath" => {
+          +                return Some(Value::String(format!("/data/app/{package}.apk")))
+          +            }
+          +            _ => return None,
+          +        };
+          +        let mut current = String::new();
+          +        for part in path.split('/').filter(|part| !part.is_empty()) {
+          +            current.push('/');
+          +            current.push_str(part);
+          +            self.framework.directories.insert(current.clone());
+          +        }
+          +        Some(Value::Object(self.alloc_file(path)))
+          +    }
+          +
           +    fn map_canon(&self, value: &Value) -> Value {
           +        match value {
           +            Value::Object(id) => match self.heap_object(*id) {
@@ -2172,9 +2358,24 @@ jobs:
           +            _ => None,
           +        }
           +    }
-           
+          +
                fn alloc(&mut self, object: HeapObject) -> ObjectId {
                    let id = self.heap.len() as ObjectId;
+                   self.heap.push(object);
+          @@ -5013,3 +5460,13 @@
+                   Value::Null => String::new(),
+               }
+           }
+          +
+          +fn join_path(parent: &str, child: &str) -> String {
+          +    if parent.is_empty() {
+          +        child.to_owned()
+          +    } else if child.is_empty() {
+          +        parent.to_owned()
+          +    } else {
+          +        format!("{}/{}", parent.trim_end_matches('/'), child.trim_start_matches('/'))
+          +    }
+          +}
           --- a/src/assets.rs
           +++ b/src/assets.rs
           @@ -1,3 +1,5 @@
@@ -2201,7 +2402,15 @@ jobs:
            const RES_TABLE_TYPE: u16 = 0x0002;
           --- a/src/framework.rs
           +++ b/src/framework.rs
-          @@ -379,6 +379,10 @@
+          @@ -365,6 +365,7 @@
+               pub sensors: HashMap<u32, SensorState>,
+               pub network_requests: Vec<NetworkRequestState>,
+               pub files: HashMap<String, Vec<u8>>,
+          +    pub directories: std::collections::HashSet<String>,
+               pub file_handles: HashMap<u32, String>,
+               pub surface_events: Vec<String>,
+               pub audio_writes: usize,
+          @@ -379,6 +380,10 @@
                pub assets: Option<AssetStore>,
                pub resource_images: HashMap<u32, String>,
                pub surface_size: (i32, i32),
