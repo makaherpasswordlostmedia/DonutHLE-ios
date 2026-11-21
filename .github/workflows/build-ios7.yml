@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -3191,6 +3191,45 @@ jobs:
           print('patched Rect')
           __DH_PY7__
           python3 /tmp/rect_fix.py
+          cat > /tmp/typeface_fix.py <<'__DH_PY8__'
+          # android.graphics.Typeface factories: create / createFromFile / defaultFromStyle (+ trivial instance getters).
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'Typeface factory methods' in s:
+              print('Typeface already patched'); sys.exit(0)
+          a = '''        if class_name == "Landroid/graphics/Typeface;" && method_name == "createFromAsset" {'''
+          b = '''        // Typeface factory methods
+                  if class_name == "Landroid/graphics/Typeface;"
+                      && matches!(
+                          method_name,
+                          "createFromAsset" | "create" | "createFromFile" | "defaultFromStyle"
+                      )
+                  {'''
+          if s.count(a) != 1:
+              sys.exit('anchor missing or ambiguous: typeface (%d)' % s.count(a))
+          s = s.replace(a, b, 1)
+          a2 = '''        Err(self.error(
+                      0,
+                      0,
+                      format!("framework method {class_name}->{method_name} is not implemented"),
+                  ))
+              }
+
+              fn resolved_scalar'''
+          if s.count(a2) == 1:
+              s = s.replace(a2, '''        if class_name == "Landroid/graphics/Typeface;" {
+                      return Ok(match method_name {
+                          "getStyle" => Value::Int(0),
+                          "isBold" | "isItalic" => Value::Int(0),
+                          _ => Value::Void,
+                      });
+                  }
+          ''' + a2, 1)
+          open(p, 'w').write(s)
+          print('patched Typeface')
+          __DH_PY8__
+          python3 /tmp/typeface_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
