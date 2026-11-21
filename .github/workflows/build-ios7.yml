@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle, String, Runtime)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle, String, Runtime, AccountManager)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -3735,6 +3735,32 @@ jobs:
           print('patched Runtime')
           __DH_PY14__
           python3 /tmp/runtime_fix.py
+          cat > /tmp/account_fix.py <<'__DH_PY15__'
+          # android.accounts.AccountManager: no accounts on this device.
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'Landroid/accounts/AccountManager;' in s:
+              print('AccountManager already patched'); sys.exit(0)
+          a = '''        if class_name == "Ljava/util/Locale;" {'''
+          b = '''        if class_name == "Landroid/accounts/AccountManager;" {
+                      return Ok(match method_name {
+                          "get" => Value::Object(self.alloc_instance("Landroid/accounts/AccountManager;")),
+                          "getAccounts" | "getAccountsByType" => Value::Object(self.alloc(HeapObject::Array {
+                              component: "Landroid/accounts/Account;".to_owned(),
+                              values: Vec::new(),
+                          })),
+                          _ => Value::Void,
+                      });
+                  }
+          '''
+          if a not in s:
+              sys.exit('anchor missing: locale')
+          s = s.replace(a, b + a, 1)
+          open(p, 'w').write(s)
+          print('patched AccountManager')
+          __DH_PY15__
+          python3 /tmp/account_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
