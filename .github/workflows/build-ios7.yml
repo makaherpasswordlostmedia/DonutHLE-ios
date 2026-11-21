@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -3262,6 +3262,89 @@ jobs:
           print('patched TextPaint')
           __DH_PY9__
           python3 /tmp/paint_fix.py
+          cat > /tmp/math_fix.py <<'__DH_PY10__'
+          # java.lang.Math: wide (double/long) arguments arrive as value + Void half, so compact them; add log/exp/pow/floor/ceil/...
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'compact wide Math arguments' in s:
+              print('Math already patched'); sys.exit(0)
+
+          a = '''        if class_name == "Ljava/lang/Math;" {
+                      return match method_name {
+                          "round" =>'''
+          b = '''        if class_name == "Ljava/lang/Math;" {
+                      // compact wide Math arguments: a double/long is followed by a Void register half
+                      let compact: Vec<Value> = {
+                          let mut out = Vec::with_capacity(args.len());
+                          let mut skip_half = false;
+                          for value in args {
+                              if skip_half {
+                                  skip_half = false;
+                                  if matches!(value, Value::Void) {
+                                      continue;
+                                  }
+                              }
+                              out.push(value.clone());
+                              if matches!(value, Value::Double(_) | Value::Long(_)) {
+                                  skip_half = true;
+                              }
+                          }
+                          out
+                      };
+                      let args: &[Value] = &compact;
+                      let operand = |index: usize| -> Result<f64, VmError> {
+                          as_double(args.get(index).cloned().unwrap_or(Value::Int(0)), 0, 0)
+                      };
+                      return match method_name {
+                          "round" =>'''
+          if s.count(a) < 1:
+              sys.exit('anchor missing: Math head')
+          s = s.replace(a, b, 1)
+
+          a = '''                _ => Err(self.error(
+                              0,
+                              0,
+                              format!("java.lang.Math method {method_name} is not implemented"),
+                          )),'''
+          b = '''                "log" | "log10" | "exp" | "floor" | "ceil" | "rint" | "cbrt" | "sinh" | "cosh"
+                          | "tanh" | "signum" | "log1p" | "expm1" => {
+                              let value = operand(0)?;
+                              Ok(Value::Double(match method_name {
+                                  "log" => value.ln(),
+                                  "log10" => value.log10(),
+                                  "exp" => value.exp(),
+                                  "floor" => value.floor(),
+                                  "ceil" => value.ceil(),
+                                  "rint" => value.round_ties_even(),
+                                  "cbrt" => value.cbrt(),
+                                  "sinh" => value.sinh(),
+                                  "cosh" => value.cosh(),
+                                  "tanh" => value.tanh(),
+                                  "signum" => {
+                                      if value == 0.0 || value.is_nan() {
+                                          value
+                                      } else {
+                                          value.signum()
+                                      }
+                                  }
+                                  "log1p" => value.ln_1p(),
+                                  _ => value.exp_m1(),
+                              }))
+                          }
+                          "pow" => Ok(Value::Double(operand(0)?.powf(operand(1)?))),
+                          "hypot" => Ok(Value::Double(operand(0)?.hypot(operand(1)?))),
+                          "random" => Ok(Value::Double(
+                              ((self.executed_steps as f64 + 1.0) * 0.618_033_988_749_894_9) % 1.0,
+                          )),
+          '''
+          if s.count(a) < 1:
+              sys.exit('anchor missing: Math tail')
+          s = s.replace(a, b + a, 1)
+          open(p, 'w').write(s)
+          print('patched Math')
+          __DH_PY10__
+          python3 /tmp/math_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
