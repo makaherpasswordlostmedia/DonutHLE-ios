@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle, String, Runtime, AccountManager, system services, System.gc)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle, String, Runtime, AccountManager, system services, System.gc, launch step limit)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -3844,6 +3844,27 @@ jobs:
           print('patched System.gc')
           __DH_PY17__
           python3 /tmp/gc_fix.py
+          cat > /tmp/steps_fix.py <<'__DH_PY18__'
+          # Launch (non-frame) instruction budget: game constructors (Armored Strike RSL/a.<init> etc.) need far more than
+          # the 100k/1M default. Frame mode keeps its per-frame max_steps budget untouched.
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'LAUNCH_STEP_LIMIT' in s:
+              print('launch step limit already patched'); sys.exit(0)
+          a = 'if !self.frame_mode && self.executed_steps > self.config.max_steps {'
+          b = 'if !self.frame_mode && self.executed_steps > self.config.max_steps.max(LAUNCH_STEP_LIMIT) {'
+          if a not in s:
+              sys.exit('anchor missing: instruction limit')
+          s = s.replace(a, b, 1)
+          s = s.replace('#[derive(Debug, Clone, PartialEq, Eq)]\npub struct VmConfig {',
+                        '/// Non-frame (launch) instruction budget.\nconst LAUNCH_STEP_LIMIT: usize = 300_000_000;\n\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct VmConfig {', 1)
+          if 'const LAUNCH_STEP_LIMIT' not in s:
+              sys.exit('anchor missing: VmConfig')
+          open(p, 'w').write(s)
+          print('patched launch step limit')
+          __DH_PY18__
+          python3 /tmp/steps_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
