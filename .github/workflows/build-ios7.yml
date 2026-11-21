@@ -1698,7 +1698,26 @@ jobs:
                    Ok((
                        self.vm.framework.gles.command_count(),
                        self.vm.framework.gles.rendered_pixels(),
-          @@ -259,14 +265,36 @@
+          @@ -213,6 +219,8 @@
+                   let entry_method = dex.method_code(&class_name, "onCreate").is_some();
+                   Ok(LaunchPlan {
+                       package: manifest.package,
+          +            version_name: manifest.version_name,
+          +            version_code: manifest.version_code,
+                       application_label,
+                       activity,
+                       class_name,
+          @@ -238,6 +246,9 @@
+                       let mut framework = std::mem::take(&mut self.framework);
+                       framework.activities = activities.clone();
+                       framework.assets = Some(plan.assets.clone());
+          +            framework.package_name = plan.package.clone();
+          +            framework.version_name = plan.version_name.clone();
+          +            framework.version_code = plan.version_code.unwrap_or(1) as i32;
+                       if let Some(resources) = &plan.resources {
+                           for value in &resources.values {
+                               framework
+          @@ -259,14 +270,36 @@
                                max_call_depth: 256,
                            },
                        );
@@ -1743,6 +1762,15 @@ jobs:
                        let activity_object = vm.alloc_instance(plan.class_name.clone());
                        let value = vm
                            .run_method(
+          @@ -352,6 +385,8 @@
+           #[derive(Debug)]
+           pub struct LaunchPlan {
+               pub package: String,
+          +    pub version_name: Option<String>,
+          +    pub version_code: Option<u32>,
+               pub application_label: Option<String>,
+               pub activity: String,
+               pub class_name: String,
           --- a/src/vm.rs
           +++ b/src/vm.rs
           @@ -35,6 +35,15 @@
@@ -1784,7 +1812,22 @@ jobs:
                                            (unit & 0xff) as u32
                                        } else {
                                            (unit >> 8) as u32
-          @@ -2751,17 +2765,29 @@
+          @@ -2215,6 +2229,14 @@
+                                   });
+                               return Ok(Value::Object(object));
+                           }
+          +                "getPackageName" => {
+          +                    return Ok(Value::String(self.framework.package_name.clone()))
+          +                }
+          +                "getPackageManager" => {
+          +                    return Ok(Value::Object(
+          +                        self.alloc_instance("Landroid/content/pm/PackageManager;"),
+          +                    ))
+          +                }
+                           "getSharedPreferences" => {
+                               let prefs = self.alloc_instance("Landroid/content/SharedPreferences;");
+                               self.set_object_field(
+          @@ -2751,17 +2773,29 @@
                            || class_name == "Ljava/util/ArrayList;"
                            || class_name == "Ljava/util/LinkedList;"
                            || class_name == "Ljava/util/HashMap;"
@@ -1815,7 +1858,67 @@ jobs:
                                }
                            }
                        } else if class_name == "Ljava/lang/StringBuilder;" {
-          @@ -3343,11 +3369,157 @@
+          @@ -2979,9 +3013,59 @@
+                   {
+                       return Ok(Value::Object(self.alloc_instance("Ljava/io/File;")));
+                   }
+          +        if class_name == "Landroid/content/pm/PackageManager;" {
+          +            return match method_name {
+          +                "getPackageInfo" => {
+          +                    let info = self.alloc_instance("Landroid/content/pm/PackageInfo;");
+          +                    let package = self.framework.package_name.clone();
+          +                    let version_name = self.framework.version_name.clone();
+          +                    let version_code = self.framework.version_code;
+          +                    let application = self.alloc_instance("Landroid/content/pm/ApplicationInfo;");
+          +                    self.set_object_field(application, "packageName", Value::String(package.clone()));
+          +                    self.set_object_field(application, "name", Value::String(package.clone()));
+          +                    self.set_object_field(application, "flags", Value::Int(0));
+          +                    self.set_object_field(info, "packageName", Value::String(package));
+          +                    self.set_object_field(
+          +                        info,
+          +                        "versionName",
+          +                        version_name.map(Value::String).unwrap_or(Value::Null),
+          +                    );
+          +                    self.set_object_field(info, "versionCode", Value::Int(version_code));
+          +                    self.set_object_field(info, "applicationInfo", Value::Object(application));
+          +                    Ok(Value::Object(info))
+          +                }
+          +                "getApplicationInfo" => {
+          +                    let application = self.alloc_instance("Landroid/content/pm/ApplicationInfo;");
+          +                    let package = self.framework.package_name.clone();
+          +                    self.set_object_field(application, "packageName", Value::String(package.clone()));
+          +                    self.set_object_field(application, "name", Value::String(package));
+          +                    self.set_object_field(application, "flags", Value::Int(0));
+          +                    Ok(Value::Object(application))
+          +                }
+          +                "getApplicationLabel" => Ok(Value::String(self.framework.package_name.clone())),
+          +                "checkPermission" => Ok(Value::Int(0)), // PERMISSION_GRANTED
+          +                "hasSystemFeature" => Ok(Value::Int(0)),
+          +                "getInstalledPackages" | "getInstalledApplications" => Ok(Value::Object(
+          +                    self.alloc(HeapObject::Collection(Vec::new())),
+          +                )),
+          +                _ => Ok(Value::Void),
+          +            };
+          +        }
+                   if class_name == "Landroid/content/Context;" || class_name.starts_with("Landroid/app/") {
+                       return match method_name {
+                           "getApplicationContext" => object_arg(args, 0).map(Value::Object),
+          +                "getPackageName" => Ok(Value::String(self.framework.package_name.clone())),
+          +                "getPackageManager" => Ok(Value::Object(
+          +                    self.alloc_instance("Landroid/content/pm/PackageManager;"),
+          +                )),
+          +                "getApplicationInfo" => {
+          +                    let application = self.alloc_instance("Landroid/content/pm/ApplicationInfo;");
+          +                    let package = self.framework.package_name.clone();
+          +                    self.set_object_field(application, "packageName", Value::String(package.clone()));
+          +                    self.set_object_field(application, "name", Value::String(package));
+          +                    self.set_object_field(application, "flags", Value::Int(0));
+          +                    Ok(Value::Object(application))
+          +                }
+                           "getResources" => Ok(Value::Object(
+                               self.alloc_instance("Landroid/content/res/Resources;"),
+                           )),
+          @@ -3343,11 +3427,157 @@
                            _ => {}
                        }
                    }
@@ -1973,7 +2076,7 @@ jobs:
                        || class_name == "Ljava/util/List;"
                        || class_name == "Ljava/util/AbstractList;"
                        || class_name == "Ljava/util/AbstractCollection;"
-          @@ -3398,6 +3570,13 @@
+          @@ -3398,6 +3628,13 @@
                                }
                                return Ok(Value::Void);
                            }
@@ -1987,7 +2090,7 @@ jobs:
                            _ => return Ok(Value::Void),
                        }
                    }
-          @@ -4013,6 +4192,45 @@
+          @@ -4013,6 +4250,45 @@
                                .blend_func(int_arg(args, 1)? as u32, int_arg(args, 2)? as u32);
                            FrameworkResult::Void
                        }
@@ -2033,7 +2136,7 @@ jobs:
                        ("Lcom/badlogic/gdx/graphics/GLCommon;", "glBindTexture")
                        | ("Lcom/badlogic/gdx/graphics/GL10;", "glBindTexture") => {
                            self.framework
-          @@ -4114,7 +4332,7 @@
+          @@ -4114,7 +4390,7 @@
                            FrameworkResult::Int(value as i32)
                        }
                        ("Lcom/badlogic/gdx/math/MathUtils;", "randomBoolean") => {
@@ -2042,7 +2145,7 @@ jobs:
                        }
                        ("Lcom/badlogic/gdx/math/MathUtils;", "round") => {
                            FrameworkResult::Int(float_arg(args, 0)?.round() as i32)
-          @@ -4619,6 +4837,29 @@
+          @@ -4619,6 +4895,29 @@
                        _ => None,
                    }
                }
@@ -2096,6 +2199,19 @@ jobs:
            use anyhow::{bail, Context, Result};
            
            const RES_TABLE_TYPE: u16 = 0x0002;
+          --- a/src/framework.rs
+          +++ b/src/framework.rs
+          @@ -379,6 +379,10 @@
+               pub assets: Option<AssetStore>,
+               pub resource_images: HashMap<u32, String>,
+               pub surface_size: (i32, i32),
+          +    /// Manifest data for PackageManager / Context.getPackageName.
+          +    pub package_name: String,
+          +    pub version_name: Option<String>,
+          +    pub version_code: i32,
+               next_handle: u32,
+           }
+           
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
