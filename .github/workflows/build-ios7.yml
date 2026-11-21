@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware method lookup)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -2639,6 +2639,203 @@ jobs:
               print('dalvik.rs already patched')
           __DH_PY2__
           python3 /tmp/proto_fix.py
+          cat > /tmp/set_fix.py <<'__DH_PY3__'
+          # java.util.TreeSet / HashSet / LinkedHashSet support (unique elements, TreeSet keeps natural order).
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'fn dispatch_set' in s:
+              print('sets already patched'); sys.exit(0)
+
+          def rep(a, b, what):
+              global s
+              if s.count(a) < 1:
+                  sys.exit('anchor missing: ' + what)
+              s = s.replace(a, b, 1)
+
+          rep('''    view_touch_listeners: HashMap<ObjectId, ObjectId>,
+          }
+          ''', '''    view_touch_listeners: HashMap<ObjectId, ObjectId>,
+              /// Collections that behave as java.util.Set; value = keep sorted (TreeSet).
+              set_objects: HashMap<ObjectId, bool>,
+          }
+          ''', 'struct')
+          rep('''            view_touch_listeners: HashMap::new(),
+                  }
+              }
+          ''', '''            view_touch_listeners: HashMap::new(),
+                      set_objects: HashMap::new(),
+                  }
+              }
+          ''', 'ctor')
+          rep('''        if class_name == "Ljava/util/Locale;" {''', '''        {
+                      let is_set_class = matches!(
+                          class_name,
+                          "Ljava/util/TreeSet;"
+                              | "Ljava/util/HashSet;"
+                              | "Ljava/util/LinkedHashSet;"
+                              | "Ljava/util/SortedSet;"
+                              | "Ljava/util/AbstractSet;"
+                      );
+                      let receiver_is_set = matches!(
+                          args.first(),
+                          Some(Value::Object(id)) if self.set_objects.contains_key(id)
+                      ) && matches!(
+                          class_name,
+                          "Ljava/util/Set;" | "Ljava/util/Collection;" | "Ljava/util/AbstractCollection;"
+                      );
+                      if is_set_class || receiver_is_set {
+                          return self.dispatch_set(method_name, args);
+                      }
+                  }
+                  if class_name == "Ljava/util/Locale;" {''', 'locale')
+          rep('''    fn dispatch_gdx(
+                  &mut self,''', '''    fn resolved_scalar(&self, value: &Value) -> Value {
+                  match value {
+                      Value::Object(id) => match self.heap_object(*id) {
+                          Some(HeapObject::String(text)) => Value::String(text.clone()),
+                          Some(HeapObject::Boxed(inner)) => inner.clone(),
+                          _ => value.clone(),
+                      },
+                      _ => value.clone(),
+                  }
+              }
+
+              fn semantic_eq(&self, left: &Value, right: &Value) -> bool {
+                  self.resolved_scalar(left) == self.resolved_scalar(right)
+              }
+
+              fn order_values(&self, left: &Value, right: &Value) -> std::cmp::Ordering {
+                  match (self.resolved_scalar(left), self.resolved_scalar(right)) {
+                      (Value::Int(a), Value::Int(b)) => a.cmp(&b),
+                      (Value::Long(a), Value::Long(b)) => a.cmp(&b),
+                      (Value::Float(a), Value::Float(b)) => {
+                          a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+                      }
+                      (Value::Double(a), Value::Double(b)) => {
+                          a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+                      }
+                      (Value::String(a), Value::String(b)) => a.cmp(&b),
+                      _ => std::cmp::Ordering::Equal,
+                  }
+              }
+
+              fn set_add(&self, items: &mut Vec<Value>, item: Value, sorted: bool) -> bool {
+                  if items.iter().any(|existing| self.semantic_eq(existing, &item)) {
+                      return false;
+                  }
+                  items.push(item);
+                  if sorted {
+                      items.sort_by(|a, b| self.order_values(a, b));
+                  }
+                  true
+              }
+
+              /// java.util.TreeSet / HashSet / LinkedHashSet, stored as a Collection plus an entry in `set_objects`.
+              fn dispatch_set(&mut self, method_name: &str, args: &[Value]) -> Result<Value, VmError> {
+                  let receiver = object_arg(args, 0)?;
+                  let source_items = |vm: &Self, index: usize| -> Vec<Value> {
+                      match args.get(index) {
+                          Some(Value::Object(id)) => match vm.heap_object(*id) {
+                              Some(HeapObject::Collection(values)) => values.clone(),
+                              _ => Vec::new(),
+                          },
+                          _ => Vec::new(),
+                      }
+                  };
+                  if method_name == "<init>" {
+                      let sorted = matches!(
+                          self.heap_object(receiver),
+                          Some(HeapObject::Instance { class_name, .. })
+                              if class_name == "Ljava/util/TreeSet;"
+                      );
+                      let mut items = Vec::new();
+                      for item in source_items(self, 1) {
+                          self.set_add(&mut items, item, false);
+                      }
+                      if sorted {
+                          items.sort_by(|a, b| self.order_values(a, b));
+                      }
+                      if let Some(slot) = self.heap.get_mut(receiver as usize) {
+                          *slot = HeapObject::Collection(items);
+                      }
+                      self.set_objects.insert(receiver, sorted);
+                      return Ok(Value::Void);
+                  }
+                  let sorted = self.set_objects.get(&receiver).copied().unwrap_or(false);
+                  let mut values = match self.heap_object(receiver) {
+                      Some(HeapObject::Collection(values)) => values.clone(),
+                      _ => Vec::new(),
+                  };
+                  let mut changed = false;
+                  let result = match method_name {
+                      "size" => Value::Int(values.len() as i32),
+                      "isEmpty" => Value::Int(i32::from(values.is_empty())),
+                      "contains" => {
+                          let wanted = args.get(1).cloned().unwrap_or(Value::Null);
+                          Value::Int(i32::from(
+                              values.iter().any(|item| self.semantic_eq(item, &wanted)),
+                          ))
+                      }
+                      "add" => {
+                          let item = args.get(1).cloned().unwrap_or(Value::Null);
+                          let added = self.set_add(&mut values, item, sorted);
+                          changed = added;
+                          Value::Int(i32::from(added))
+                      }
+                      "addAll" => {
+                          let mut any = false;
+                          for item in source_items(self, 1) {
+                              any |= self.set_add(&mut values, item, sorted);
+                          }
+                          changed = any;
+                          Value::Int(i32::from(any))
+                      }
+                      "remove" => {
+                          let wanted = args.get(1).cloned().unwrap_or(Value::Null);
+                          let position = values
+                              .iter()
+                              .position(|item| self.semantic_eq(item, &wanted));
+                          if let Some(position) = position {
+                              values.remove(position);
+                              changed = true;
+                          }
+                          Value::Int(i32::from(position.is_some()))
+                      }
+                      "clear" => {
+                          values.clear();
+                          changed = true;
+                          Value::Void
+                      }
+                      "first" => values.first().cloned().unwrap_or(Value::Null),
+                      "last" => values.last().cloned().unwrap_or(Value::Null),
+                      "iterator" => {
+                          let items = values.clone();
+                          Value::Object(self.alloc(HeapObject::Iterator { items, pos: 0 }))
+                      }
+                      "toArray" => {
+                          let items = values.clone();
+                          Value::Object(self.alloc(HeapObject::Array {
+                              component: "Ljava/lang/Object;".to_owned(),
+                              values: items,
+                          }))
+                      }
+                      _ => Value::Void,
+                  };
+                  if changed {
+                      if let Some(slot) = self.heap.get_mut(receiver as usize) {
+                          *slot = HeapObject::Collection(values);
+                      }
+                  }
+                  Ok(result)
+              }
+
+              fn dispatch_gdx(
+                  &mut self,''', 'gdx')
+          open(p, 'w').write(s)
+          print('patched sets')
+          __DH_PY3__
+          python3 /tmp/set_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
