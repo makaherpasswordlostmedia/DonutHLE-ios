@@ -2519,6 +2519,84 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
+      - name: Patch Rust core (android.preference.PreferenceManager + SharedPreferences fixes)
+        run: |
+          set -e
+          cat > /tmp/prefs_fix.py <<'__DH_PY__'
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'Landroid/preference/PreferenceManager;' in s:
+              print('already patched'); sys.exit(0)
+
+          def rep(a, b, what):
+              global s
+              if a not in s:
+                  sys.exit('anchor missing: ' + what)
+              s = s.replace(a, b, 1)
+
+          rep('''        if class_name == "Landroid/os/Environment;" && method_name == "getExternalStorageDirectory"
+                  {''', '''        if class_name == "Landroid/preference/PreferenceManager;" {
+                      return match method_name {
+                          "getDefaultSharedPreferences" => {
+                              let prefs = self.alloc_instance("Landroid/content/SharedPreferences;");
+                              self.set_object_field(
+                                  prefs,
+                                  "name",
+                                  Value::String("default_preferences".to_owned()),
+                              );
+                              Ok(Value::Object(prefs))
+                          }
+                          "setDefaultValues" => Ok(Value::Void),
+                          _ => Err(self.error(
+                              0,
+                              0,
+                              format!("framework method {class_name}->{method_name} is not implemented"),
+                          )),
+                      };
+                  }
+                  if class_name == "Landroid/os/Environment;" && method_name == "getExternalStorageDirectory"
+                  {''', 'Environment')
+
+          rep('''                "edit" => {
+                              let editor = self.alloc_instance("Landroid/content/SharedPreferences$Editor;");''',
+          '''                "contains" => Ok(Value::Int(i32::from(
+                              self.framework
+                                  .preferences
+                                  .contains_key(&(name, self.string_arg(args, 1).unwrap_or_default())),
+                          ))),
+                          "edit" => {
+                              let editor = self.alloc_instance("Landroid/content/SharedPreferences$Editor;");''', 'edit')
+
+          rep('''            let prefs = self.object_field_object(editor, "prefs").unwrap_or(editor);
+                      let key = self.string_arg(args, 1).unwrap_or_default();
+                      return match method_name {''',
+          '''            let prefs = self.object_field_object(editor, "prefs").unwrap_or(editor);
+                      let prefs_name = self
+                          .object_field_string(prefs, "name")
+                          .unwrap_or_else(|| prefs.to_string());
+                      let key = self.string_arg(args, 1).unwrap_or_default();
+                      return match method_name {
+                          "remove" => {
+                              self.framework.preferences.remove(&(prefs_name, key));
+                              Ok(Value::Object(editor))
+                          }
+                          "clear" => {
+                              self.framework
+                                  .preferences
+                                  .retain(|(name, _), _| *name != prefs_name);
+                              Ok(Value::Object(editor))
+                          }''', 'editor')
+
+          rep('''                        .insert((prefs.to_string(), key), value);
+                              Ok(Value::Object(editor))''',
+          '''                        .insert((prefs_name, key), value);
+                              Ok(Value::Object(editor))''', 'insert')
+          open(p, 'w').write(s)
+          print('patched vm.rs')
+          __DH_PY__
+          python3 /tmp/prefs_fix.py
+
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
           rustup toolchain install stable --profile minimal
