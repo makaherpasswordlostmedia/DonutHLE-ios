@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle, String, Runtime, AccountManager, system services)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs, Class.newInstance, clone, Rect, Typeface, TextPaint, Math, NumberFormat, auto stub toggle, String, Runtime, AccountManager, system services, System.gc)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -3822,6 +3822,28 @@ jobs:
           print('patched system services')
           __DH_PY16__
           python3 /tmp/services_fix.py
+          cat > /tmp/gc_fix.py <<'__DH_PY17__'
+          # java.lang.System.gc / runFinalization: no-ops under HLE (Armored Strike calls System.gc() in its constructor).
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'System.gc no-op' in s:
+              print('System.gc already patched'); sys.exit(0)
+          a = '        if class_name == "Ljava/util/Locale;" {'
+          b = """        if class_name == "Ljava/lang/System;"
+                      && matches!(method_name, "gc" | "runFinalization" | "runFinalizersOnExit")
+                  {
+                      // System.gc no-op: GC is owned by the host.
+                      return Ok(Value::Void);
+                  }
+          """
+          if a not in s:
+              sys.exit('anchor missing: locale')
+          s = s.replace(a, b + a, 1)
+          open(p, 'w').write(s)
+          print('patched System.gc')
+          __DH_PY17__
+          python3 /tmp/gc_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
