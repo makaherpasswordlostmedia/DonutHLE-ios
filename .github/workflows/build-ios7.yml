@@ -1789,7 +1789,58 @@ jobs:
                StringBuilder(String),
                Boxed(Value),
            }
-          @@ -1134,7 +1143,12 @@
+          @@ -556,8 +565,11 @@
+                                       error.pc,
+                                       error.opcode,
+                                       format!(
+          -                                "{} while dispatching {}->{}",
+          -                                error.message, owner, method.name
+          +                                "{} while dispatching {}->{} ({})",
+          +                                error.message,
+          +                                owner,
+          +                                method.name,
+          +                                self.describe_args(&args)
+                                       ),
+                                   )
+                               });
+          @@ -569,8 +581,11 @@
+                                   error.pc,
+                                   error.opcode,
+                                   format!(
+          -                            "{} while dispatching {}->{}",
+          -                            error.message, method.class_name, method.name
+          +                            "{} while dispatching {}->{} ({})",
+          +                            error.message,
+          +                            method.class_name,
+          +                            method.name,
+          +                            self.describe_args(&args)
+                                   ),
+                               )
+                           });
+          @@ -585,7 +600,21 @@
+                               if owner.starts_with("Lcom/badlogic/gdx/") {
+                                   return self.dispatch_gdx(&owner, &method.name, &args);
+                               }
+          -                    return self.dispatch_framework(&owner, &method.name, &args);
+          +                    return self
+          +                        .dispatch_framework(&owner, &method.name, &args)
+          +                        .map_err(|error| {
+          +                            self.error(
+          +                                error.pc,
+          +                                error.opcode,
+          +                                format!(
+          +                                    "{} while dispatching {}->{} ({})",
+          +                                    error.message,
+          +                                    owner,
+          +                                    method.name,
+          +                                    self.describe_args(&args)
+          +                                ),
+          +                            )
+          +                        });
+                           }
+                           let flags = self.dex.method_access_flags(method_index).unwrap_or(0);
+                           if flags & (0x0100 | 0x0400) != 0 {
+          @@ -1134,7 +1163,12 @@
                                })?;
                                let object = if matches!(
                                    class_name.as_str(),
@@ -1803,7 +1854,7 @@ jobs:
                                ) {
                                    self.alloc(HeapObject::Collection(Vec::new()))
                                } else {
-          @@ -1270,7 +1284,7 @@
+          @@ -1270,7 +1304,7 @@
                                    let mut raw = 0u32;
                                    for byte in 0..element_width {
                                        let unit = code.instructions[payload + 4 + (bit_offset + byte) / 2];
@@ -1812,7 +1863,7 @@ jobs:
                                            (unit & 0xff) as u32
                                        } else {
                                            (unit >> 8) as u32
-          @@ -2185,7 +2199,15 @@
+          @@ -2185,7 +2219,15 @@
                    }
                    if class_name == "Landroid/os/Environment;" && method_name == "getExternalStorageDirectory"
                    {
@@ -1829,7 +1880,7 @@ jobs:
                    }
                    if class_name == "Landroid/content/Context;" || class_name.starts_with("Landroid/app/") {
                        match method_name {
-          @@ -2215,6 +2237,14 @@
+          @@ -2215,6 +2257,14 @@
                                    });
                                return Ok(Value::Object(object));
                            }
@@ -1844,7 +1895,7 @@ jobs:
                            "getSharedPreferences" => {
                                let prefs = self.alloc_instance("Landroid/content/SharedPreferences;");
                                self.set_object_field(
-          @@ -2751,17 +2781,29 @@
+          @@ -2751,17 +2801,29 @@
                            || class_name == "Ljava/util/ArrayList;"
                            || class_name == "Ljava/util/LinkedList;"
                            || class_name == "Ljava/util/HashMap;"
@@ -1875,7 +1926,7 @@ jobs:
                                }
                            }
                        } else if class_name == "Ljava/lang/StringBuilder;" {
-          @@ -2977,11 +3019,61 @@
+          @@ -2977,11 +3039,61 @@
                    }
                    if class_name == "Landroid/os/Environment;" && method_name == "getExternalStorageDirectory"
                    {
@@ -1938,7 +1989,7 @@ jobs:
                            "getResources" => Ok(Value::Object(
                                self.alloc_instance("Landroid/content/res/Resources;"),
                            )),
-          @@ -3174,22 +3266,107 @@
+          @@ -3174,22 +3286,107 @@
                    }
                    if class_name == "Ljava/io/File;" {
                        let receiver = object_arg(args, 0)?;
@@ -2050,7 +2101,7 @@ jobs:
                            _ => Value::Void,
                        });
                    }
-          @@ -3343,11 +3520,157 @@
+          @@ -3343,11 +3540,157 @@
                            _ => {}
                        }
                    }
@@ -2208,7 +2259,7 @@ jobs:
                        || class_name == "Ljava/util/List;"
                        || class_name == "Ljava/util/AbstractList;"
                        || class_name == "Ljava/util/AbstractCollection;"
-          @@ -3398,6 +3721,13 @@
+          @@ -3398,6 +3741,13 @@
                                }
                                return Ok(Value::Void);
                            }
@@ -2222,7 +2273,7 @@ jobs:
                            _ => return Ok(Value::Void),
                        }
                    }
-          @@ -4013,6 +4343,45 @@
+          @@ -4013,6 +4363,45 @@
                                .blend_func(int_arg(args, 1)? as u32, int_arg(args, 2)? as u32);
                            FrameworkResult::Void
                        }
@@ -2268,7 +2319,7 @@ jobs:
                        ("Lcom/badlogic/gdx/graphics/GLCommon;", "glBindTexture")
                        | ("Lcom/badlogic/gdx/graphics/GL10;", "glBindTexture") => {
                            self.framework
-          @@ -4114,7 +4483,7 @@
+          @@ -4114,7 +4503,7 @@
                            FrameworkResult::Int(value as i32)
                        }
                        ("Lcom/badlogic/gdx/math/MathUtils;", "randomBoolean") => {
@@ -2277,12 +2328,37 @@ jobs:
                        }
                        ("Lcom/badlogic/gdx/math/MathUtils;", "round") => {
                            FrameworkResult::Int(float_arg(args, 0)?.round() as i32)
-          @@ -4620,6 +4989,84 @@
+          @@ -4620,6 +5009,109 @@
                    }
                }
            
           +    /// Key normalisation for java.util.Map: string objects compare by content, boxed numbers by value,
           +    /// everything else by identity.
+          +    /// Short description of call arguments for error messages (what kind of value each one really is).
+          +    fn describe_args(&self, args: &[Value]) -> String {
+          +        let parts: Vec<String> = args
+          +            .iter()
+          +            .take(6)
+          +            .map(|value| match value {
+          +                Value::Object(id) => match self.heap_object(*id) {
+          +                    Some(HeapObject::Instance { class_name, .. }) => class_name.clone(),
+          +                    Some(HeapObject::String(_)) => "String".to_owned(),
+          +                    Some(HeapObject::Boxed(inner)) => format!("Boxed({inner:?})"),
+          +                    Some(HeapObject::Collection(_)) => "Collection".to_owned(),
+          +                    Some(HeapObject::Map(_)) => "Map".to_owned(),
+          +                    Some(HeapObject::Array { component, .. }) => format!("Array of {component}"),
+          +                    Some(_) => "Object".to_owned(),
+          +                    None => "Object?".to_owned(),
+          +                },
+          +                Value::String(text) => {
+          +                    format!("\"{}\"", text.chars().take(24).collect::<String>())
+          +                }
+          +                other => format!("{other:?}"),
+          +            })
+          +            .collect();
+          +        parts.join(", ")
+          +    }
+          +
           +    fn alloc_file(&mut self, path: impl Into<String>) -> ObjectId {
           +        let file = self.alloc_instance("Ljava/io/File;");
           +        self.set_object_field(file, "path", Value::String(path.into()));
@@ -2362,7 +2438,7 @@ jobs:
                fn alloc(&mut self, object: HeapObject) -> ObjectId {
                    let id = self.heap.len() as ObjectId;
                    self.heap.push(object);
-          @@ -5013,3 +5460,13 @@
+          @@ -5013,3 +5505,13 @@
                    Value::Null => String::new(),
                }
            }
