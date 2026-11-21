@@ -2519,7 +2519,7 @@ jobs:
           __DH_EOF__
           patch -p1 --no-backup-if-mismatch < /tmp/ios7.patch
 
-      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet)
+      - name: Patch Rust core (PreferenceManager, SharedPreferences, prototype-aware lookup, TreeSet/HashSet, java.io stubs)
         run: |
           set -e
           cat > /tmp/prefs_fix.py <<'__DH_PY__'
@@ -2836,6 +2836,37 @@ jobs:
           print('patched sets')
           __DH_PY3__
           python3 /tmp/set_fix.py
+          cat > /tmp/io_fix.py <<'__DH_PY4__'
+          # java.io stream classes (ObjectInputStream, FileInputStream, ...): no real IO yet, behave like empty/closed streams.
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'java.io stream stub' in s:
+              print('java.io stubs already patched'); sys.exit(0)
+          a = '''        if class_name == "Landroid/graphics/Typeface;" && method_name == "createFromAsset" {'''
+          b = '''        if class_name.starts_with("Ljava/io/") && class_name != "Ljava/io/File;" {
+                      // java.io stream stub: empty input (EOF / zero values), writes are swallowed.
+                      return Ok(match method_name {
+                          "read" | "skip" => Value::Int(-1),
+                          "available" => Value::Int(0),
+                          "readInt" | "readByte" | "readShort" | "readChar" | "readBoolean"
+                          | "readUnsignedByte" | "readUnsignedShort" => Value::Int(0),
+                          "readLong" => Value::Long(0),
+                          "readFloat" => Value::Float(0.0),
+                          "readDouble" => Value::Double(0.0),
+                          "readUTF" | "readLine" => Value::String(String::new()),
+                          "readObject" => Value::Null,
+                          _ => Value::Void,
+                      });
+                  }
+          '''
+          if a not in s:
+              sys.exit('anchor missing: typeface')
+          s = s.replace(a, b + a, 1)
+          open(p, 'w').write(s)
+          print('patched java.io stubs')
+          __DH_PY4__
+          python3 /tmp/io_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
