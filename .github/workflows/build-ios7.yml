@@ -1895,7 +1895,26 @@ jobs:
                            "getSharedPreferences" => {
                                let prefs = self.alloc_instance("Landroid/content/SharedPreferences;");
                                self.set_object_field(
-          @@ -2751,17 +2801,29 @@
+          @@ -2230,6 +2280,18 @@
+                           }
+                           "setContentView" => {
+                               let activity = object_arg(args, 0)?;
+          +                    // setContentView(View): the app hands over a view object of its own class
+          +                    if let Some(Value::Object(view)) = args.get(1) {
+          +                        let view = *view;
+          +                        let view_class = match self.heap_object(view) {
+          +                            Some(HeapObject::Instance { class_name, .. }) => class_name.clone(),
+          +                            _ => "Landroid/view/View;".to_owned(),
+          +                        };
+          +                        self.framework.ensure_view(view, view_class);
+          +                        self.set_object_field(activity, "content_view", Value::Object(view));
+          +                        self.framework.content_views.insert(activity, view);
+          +                        return Ok(Value::Void);
+          +                    }
+                               let layout_id = int_arg(args, 1)? as u32;
+                               let root = self.framework.alloc_view("Landroid/widget/RelativeLayout;");
+                               self.set_object_field(activity, "content_view", Value::Object(root));
+          @@ -2751,17 +2813,29 @@
                            || class_name == "Ljava/util/ArrayList;"
                            || class_name == "Ljava/util/LinkedList;"
                            || class_name == "Ljava/util/HashMap;"
@@ -1926,7 +1945,7 @@ jobs:
                                }
                            }
                        } else if class_name == "Ljava/lang/StringBuilder;" {
-          @@ -2977,11 +3039,61 @@
+          @@ -2977,11 +3051,61 @@
                    }
                    if class_name == "Landroid/os/Environment;" && method_name == "getExternalStorageDirectory"
                    {
@@ -1989,7 +2008,7 @@ jobs:
                            "getResources" => Ok(Value::Object(
                                self.alloc_instance("Landroid/content/res/Resources;"),
                            )),
-          @@ -3174,22 +3286,107 @@
+          @@ -3174,22 +3298,107 @@
                    }
                    if class_name == "Ljava/io/File;" {
                        let receiver = object_arg(args, 0)?;
@@ -2101,7 +2120,7 @@ jobs:
                            _ => Value::Void,
                        });
                    }
-          @@ -3343,11 +3540,157 @@
+          @@ -3343,11 +3552,157 @@
                            _ => {}
                        }
                    }
@@ -2259,7 +2278,7 @@ jobs:
                        || class_name == "Ljava/util/List;"
                        || class_name == "Ljava/util/AbstractList;"
                        || class_name == "Ljava/util/AbstractCollection;"
-          @@ -3398,6 +3741,13 @@
+          @@ -3398,6 +3753,13 @@
                                }
                                return Ok(Value::Void);
                            }
@@ -2273,7 +2292,7 @@ jobs:
                            _ => return Ok(Value::Void),
                        }
                    }
-          @@ -4013,6 +4363,45 @@
+          @@ -4013,6 +4375,45 @@
                                .blend_func(int_arg(args, 1)? as u32, int_arg(args, 2)? as u32);
                            FrameworkResult::Void
                        }
@@ -2319,7 +2338,7 @@ jobs:
                        ("Lcom/badlogic/gdx/graphics/GLCommon;", "glBindTexture")
                        | ("Lcom/badlogic/gdx/graphics/GL10;", "glBindTexture") => {
                            self.framework
-          @@ -4114,7 +4503,7 @@
+          @@ -4114,7 +4515,7 @@
                            FrameworkResult::Int(value as i32)
                        }
                        ("Lcom/badlogic/gdx/math/MathUtils;", "randomBoolean") => {
@@ -2328,7 +2347,7 @@ jobs:
                        }
                        ("Lcom/badlogic/gdx/math/MathUtils;", "round") => {
                            FrameworkResult::Int(float_arg(args, 0)?.round() as i32)
-          @@ -4620,6 +5009,109 @@
+          @@ -4620,6 +5021,109 @@
                    }
                }
            
@@ -2438,7 +2457,7 @@ jobs:
                fn alloc(&mut self, object: HeapObject) -> ObjectId {
                    let id = self.heap.len() as ObjectId;
                    self.heap.push(object);
-          @@ -5013,3 +5505,13 @@
+          @@ -5013,3 +5517,13 @@
                    Value::Null => String::new(),
                }
            }
