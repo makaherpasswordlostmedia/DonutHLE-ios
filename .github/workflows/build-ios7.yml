@@ -3,6 +3,7 @@ name: Build DonutHLE iOS 7 (armv7)
 # SINGLE-FILE PORT: drop only this file into .github/workflows/ of an unmodified DonutHLE checkout and run it.
 # It writes the whole ios/ app (Theos shell, target spec, shims) and patches the Rust core by itself:
 #   - GPU op-stream recording in gles.rs + runtime.rs/lib.rs FFI (donuthle_gpu_*), VM natives for alpha/cull/fog/tex-env
+#   - generic boot: falls back to the app's own View (onDraw/onDrawFrame/render) instead of failing with "no ApplicationListener or TinySantaView"
 #   - Dalvik fixes: instance-of width, goto/32, packed/sparse-switch (fixes "register v56 is outside the frame")
 #   - slice::as_chunks compat (the crate needs Rust 1.88 otherwise), zip without C-dependent features
 # Then: Rust staticlib for armv7-apple-ios7 (-Zbuild-std) + Theos app, cross-compiled on Linux. Outputs .ipa and .deb.
@@ -4581,6 +4582,133 @@ jobs:
           print('dalvik width fix patched')
           __DH_PY22__
           python3 /tmp/width_fix.py
+
+      - name: Boot any app view (onDraw/onDrawFrame/render) when there is no ApplicationListener/TinySantaView
+        run: |
+          set -e
+          cat > /tmp/view_fix.py <<'__DH_PY23__'
+          # Generic boot for non-libgdx / non-TinySanta games (e.g. Armored Strike): after onCreate, the runtime only knew the
+          # hard-coded libgdx listener, sliceice Engine and TinySantaView and failed with
+          # "application has no ApplicationListener or TinySantaView". Fall back to the view passed to setContentView (or any app
+          # object that has onDraw / onDrawFrame / render) and drive that. Also resolve the draw method through superclasses.
+          import sys
+          def patch(p, edits, marker):
+              s = open(p).read()
+              if marker in s:
+                  print(p, 'already patched'); return
+              for a, b in edits:
+                  if s.count(a) != 1:
+                      sys.exit('anchor missing or ambiguous (%d) in %s: %r' % (s.count(a), p, a[:80]))
+                  s = s.replace(a, b, 1)
+              open(p, 'w').write(s)
+              print(p, 'patched')
+
+          patch('src/runtime.rs', [
+           ('                vm.find_instance_by_class("Lde/nurogames/android/tinysanta/views/TinySantaView;")\n'
+            '                    .ok_or_else(|| {\n'
+            '                        anyhow::anyhow!("application has no ApplicationListener or TinySantaView")\n'
+            '                    })?\n',
+            '                vm.find_instance_by_class("Lde/nurogames/android/tinysanta/views/TinySantaView;")\n'
+            '                    .or_else(|| {\n'
+            '                        vm.framework\n'
+            '                            .content_views\n'
+            '                            .get(&activity_object)\n'
+            '                            .copied()\n'
+            '                            .filter(|view| {\n'
+            '                                ["onDraw", "onDrawFrame", "render"]\n'
+            '                                    .iter()\n'
+            '                                    .any(|name| vm.has_instance_method(*view, name))\n'
+            '                            })\n'
+            '                    })\n'
+            '                    .or_else(|| vm.find_drawable_instance())\n'
+            '                    .ok_or_else(|| {\n'
+            '                        anyhow::anyhow!(\n'
+            '                            "application has no ApplicationListener, TinySantaView or drawable view (onDraw/onDrawFrame/render)"\n'
+            '                        )\n'
+            '                    })?\n'),
+           ('        let method = if self.vm.has_instance_method(self.listener, "onDraw") {\n'
+            '            "onDraw"\n'
+            '        } else {\n'
+            '            "render"\n'
+            '        };\n',
+            '        let method = if self.vm.has_instance_method(self.listener, "onDraw") {\n'
+            '            "onDraw"\n'
+            '        } else if self.vm.has_instance_method(self.listener, "onDrawFrame") {\n'
+            '            "onDrawFrame"\n'
+            '        } else {\n'
+            '            "render"\n'
+            '        };\n'),
+          ], 'find_drawable_instance')
+
+          patch('src/vm.rs', [
+           ('    pub fn has_instance_method(&self, object: ObjectId, method_name: &str) -> bool {\n',
+            '    /// First heap instance of an app class that can be drawn (`onDraw`, then `onDrawFrame`, then `render`).\n'
+            '    pub fn find_drawable_instance(&self) -> Option<ObjectId> {\n'
+            '        ["onDraw", "onDrawFrame", "render"].into_iter().find_map(|name| {\n'
+            '            (0..self.heap.len() as ObjectId).find(|&id| self.has_instance_method(id, name))\n'
+            '        })\n'
+            '    }\n'
+            '    pub fn has_instance_method(&self, object: ObjectId, method_name: &str) -> bool {\n'),
+           ('            _ => return Err(self.error(0, 0, "listener is not an object instance")),\n'
+            '        };\n'
+            '        let method_index = self\n'
+            '            .dex\n'
+            '            .methods\n'
+            '            .iter()\n'
+            '            .enumerate()\n'
+            '            .find(|(index, method)| {\n'
+            '                method.class_name == class_name\n',
+            '            _ => return Err(self.error(0, 0, "listener is not an object instance")),\n'
+            '        };\n'
+            '        // draw methods are often inherited from an app base view: resolve the declaring class via superclasses\n'
+            '        let class_name = {\n'
+            '            let mut current = class_name.clone();\n'
+            '            let mut visited = std::collections::BTreeSet::new();\n'
+            '            loop {\n'
+            '                if self.dex.methods.iter().enumerate().any(|(index, method)| {\n'
+            '                    method.class_name == current\n'
+            '                        && method.name == method_name\n'
+            '                        && self.dex.method_code_by_index(index).is_some()\n'
+            '                }) {\n'
+            '                    break current;\n'
+            '                }\n'
+            '                if !visited.insert(current.clone()) {\n'
+            '                    break class_name;\n'
+            '                }\n'
+            '                match self\n'
+            '                    .dex\n'
+            '                    .find_class(&current)\n'
+            '                    .and_then(|class| class.super_class.clone())\n'
+            '                {\n'
+            '                    Some(parent) => current = parent,\n'
+            '                    None => break class_name,\n'
+            '                }\n'
+            '            }\n'
+            '        };\n'
+            '        let method_index = self\n'
+            '            .dex\n'
+            '            .methods\n'
+            '            .iter()\n'
+            '            .enumerate()\n'
+            '            .find(|(index, method)| {\n'
+            '                method.class_name == class_name\n'),
+           ('        if method_name == "onDraw" {\n'
+            '            args.push(Value::Object(\n'
+            '                self.alloc_instance("Landroid/graphics/Canvas;"),\n'
+            '            ));\n'
+            '        }\n',
+            '        if method_name == "onDraw" {\n'
+            '            args.push(Value::Object(\n'
+            '                self.alloc_instance("Landroid/graphics/Canvas;"),\n'
+            '            ));\n'
+            '        } else if method_name == "onDrawFrame" {\n'
+            '            args.push(Value::Object(\n'
+            '                self.alloc_instance("Ljavax/microedition/khronos/opengles/GL10;"),\n'
+            '            ));\n'
+            '        }\n'),
+          ], 'find_drawable_instance')
+          __DH_PY23__
+          python3 /tmp/view_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
