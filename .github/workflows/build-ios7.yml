@@ -3866,6 +3866,33 @@ jobs:
           __DH_PY18__
           python3 /tmp/steps_fix.py
 
+      - name: Fix aput opcode (0x4b was executed as aget; caused endless array-init loops)
+        run: |
+          set -e
+          cat > /tmp/aput_fix.py <<'__DH_PY21__'
+          # Dalvik opcode map fix: 0x4b is `aput` (int), 0x44..=0x4a are the aget family. The interpreter treated 0x4b as an
+          # aget and started aput at 0x4c, so `aput vA, vB, vC` read the array instead of writing it. Array-init loops like
+          # `for (i = 0; i < n; i++) a[i] = i;` (Armored Strike RSL/a.<init>) then never terminated.
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if '0x44..=0x4a => {' in s:
+              print('aput fix already patched'); sys.exit(0)
+          edits = [
+           ('                0x44..=0x4b => {\n                    let (dest, array_reg, index_reg) =',
+            '                0x44..=0x4a => {\n                    let (dest, array_reg, index_reg) ='),
+           ('                0x4c..=0x51 => {\n                    let (value_reg, array_reg, index_reg) =',
+            '                0x4b..=0x51 => {\n                    let (value_reg, array_reg, index_reg) ='),
+          ]
+          for a, b in edits:
+              if s.count(a) != 1:
+                  sys.exit('anchor missing or ambiguous (%d): %r' % (s.count(a), a[:70]))
+              s = s.replace(a, b, 1)
+          open(p, 'w').write(s)
+          print('aput fix patched')
+          __DH_PY21__
+          python3 /tmp/aput_fix.py
+
       - name: Add launch diagnostics (Documents/donuthle.log, live boot status, launch timeout)
         run: |
           set -e
@@ -3883,6 +3910,7 @@ jobs:
           use std::time::Instant;
 
           const RING_N: usize = 16;
+          const STACK_N: usize = 300;
           const APP_LOG_LIMIT: usize = 400;
 
           static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
@@ -3909,6 +3937,8 @@ jobs:
           #[allow(clippy::declare_interior_mutable_const)]
           const ZERO: AtomicUsize = AtomicUsize::new(0);
           static RING: [AtomicUsize; RING_N] = [ZERO; RING_N];
+          static STACK: [AtomicUsize; STACK_N] = [ZERO; STACK_N];
+          static CALLS: AtomicU64 = AtomicU64::new(0);
 
           struct Trace {
               ring: Vec<u64>,
@@ -4039,6 +4069,7 @@ jobs:
               for counter in [&STEPS, &DEPTH, &PC, &LAST_STEPS, &APP_LOGS, &RING_POS] {
                   counter.store(0, Ordering::Relaxed);
               }
+              CALLS.store(0, Ordering::Relaxed);
               LAST_MS.store(0, Ordering::Relaxed);
               SLEEP_COUNT.store(0, Ordering::Relaxed);
               SLEEP_MS.store(0, Ordering::Relaxed);
@@ -4071,9 +4102,13 @@ jobs:
           }
 
           #[inline]
-          pub fn enter(method_index: usize) {
+          pub fn enter(method_index: usize, depth: usize) {
               let at = RING_POS.fetch_add(1, Ordering::Relaxed);
               RING[at % RING_N].store(method_index, Ordering::Relaxed);
+              CALLS.fetch_add(1, Ordering::Relaxed);
+              if depth < STACK_N {
+                  STACK[depth].store(method_index, Ordering::Relaxed);
+              }
           }
 
           /// Called every 65536 interpreter steps. `Some(message)` asks the VM to abort the launch.
@@ -4161,6 +4196,27 @@ jobs:
               out.join(" <- ")
           }
 
+          fn short_name(full: &str) -> String {
+              full.trim_start_matches("Lcom/requiem/")
+                  .trim_start_matches("Landroid/")
+                  .replace(';', "")
+          }
+
+          /// Shadow call stack: frames 0..depth (outermost first), then the last callee entered at `depth`.
+          fn stack_string(last_frames: usize) -> String {
+              let depth = DEPTH.load(Ordering::Relaxed).min(STACK_N - 1);
+              let Ok(names) = METHODS.try_lock() else {
+                  return String::new();
+              };
+              let from = (depth + 1).saturating_sub(last_frames);
+              let mut out = Vec::new();
+              for d in from..=depth {
+                  let idx = STACK[d].load(Ordering::Relaxed);
+                  out.push(short_name(&method_name(idx, &names)));
+              }
+              out.join(" > ")
+          }
+
           fn phase_name() -> String {
               PHASE.try_lock().map(|p| p.clone()).unwrap_or_default()
           }
@@ -4171,11 +4227,12 @@ jobs:
                   .map(|t| t.recent(2))
                   .unwrap_or_default();
               format!(
-                  "phase: {}\nsteps: {} depth: {}\nmethods: {}\nnative: {}",
+                  "phase: {}\nsteps: {} depth: {} calls: {}\nstack: {}\nnative: {}",
                   phase_name(),
                   STEPS.load(Ordering::Relaxed),
                   DEPTH.load(Ordering::Relaxed),
-                  recent_methods(3),
+                  CALLS.load(Ordering::Relaxed),
+                  stack_string(6),
                   natives
               )
           }
@@ -4196,7 +4253,7 @@ jobs:
               };
               let stubs = STUBS.try_lock().map(|t| t.top(6)).unwrap_or_default();
               format!(
-                  "STATUS phase={} launching={} launch={}s steps={} ({} steps/s) depth={} pc={} frame_mode={}\n  last methods: {}\n  last natives: {}\n  top natives: {}\n  top auto-stubs: {}\n  sleeps: {} calls / {} ms; app logs: {}",
+                  "STATUS phase={} launching={} launch={}s steps={} ({} steps/s) depth={} pc={} frame_mode={}\n  stack: {}\n  calls: {}\n  last methods: {}\n  last natives: {}\n  top natives: {}\n  top auto-stubs: {}\n  sleeps: {} calls / {} ms; app logs: {}",
                   phase_name(),
                   LAUNCHING.load(Ordering::Relaxed),
                   launch_secs(),
@@ -4205,6 +4262,8 @@ jobs:
                   DEPTH.load(Ordering::Relaxed),
                   PC.load(Ordering::Relaxed),
                   FRAME_MODE.load(Ordering::Relaxed),
+                  stack_string(40),
+                  CALLS.load(Ordering::Relaxed),
                   recent_methods(RING_N),
                   recent,
                   top,
@@ -4362,7 +4421,7 @@ jobs:
           patch('src/vm.rs', [
               ('    fn call_method(&mut self, method_index: usize, args: Vec<Value>) -> Result<Value, VmError> {\n',
                '    fn call_method(&mut self, method_index: usize, args: Vec<Value>) -> Result<Value, VmError> {\n'
-               '        crate::dhlog::enter(method_index);\n'),
+               '        crate::dhlog::enter(method_index, self.call_depth);\n'),
               ('            self.executed_steps += 1;\n            if self.frame_mode {',
                '            self.executed_steps += 1;\n'
                '            if self.executed_steps & 0xFFFF == 0 {\n'
