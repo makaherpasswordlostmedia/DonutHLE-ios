@@ -4710,6 +4710,110 @@ jobs:
           __DH_PY23__
           python3 /tmp/view_fix.py
 
+      - name: Run queued Runnables (post/queueEvent/runOnUiThread) each frame and route touches to onTouchEvent
+        run: |
+          set -e
+          cat > /tmp/input_fix.py <<'__DH_PY24__'
+          # Armored Strike boots but stays black ("commands=1, rendered pixels: 0") and taps fail with "view has no touch listener":
+          #  - View.post / Handler.post / Activity.runOnUiThread / GLSurfaceView.queueEvent silently dropped their Runnable, so the
+          #    game's own init/draw-thread work (RSLMainApp$2 via runOnDrawThread) never ran. They are queued now and executed at
+          #    the start of the next frame.
+          #  - Touches only worked for views with setOnTouchListener. Views that override onTouchEvent/dispatchTouchEvent are
+          #    called directly now, and a view without any touch handler is a no-op instead of an error.
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'pending_runnables' in s:
+              print('input fix already patched'); sys.exit(0)
+          edits = [
+           ('    frame_aborted: bool,\n',
+            '    frame_aborted: bool,\n    pending_runnables: Vec<ObjectId>,\n'),
+           ('            frame_aborted: false,\n',
+            '            frame_aborted: false,\n            pending_runnables: Vec::new(),\n'),
+           ('        let listener = self\n'
+            '            .view_touch_listeners\n'
+            '            .get(&view)\n'
+            '            .copied()\n'
+            '            .ok_or_else(|| self.error(0, 0, "view has no touch listener"))?;\n'
+            '        let event = self.alloc_instance("Landroid/view/MotionEvent;");\n'
+            '        self.set_object_field(event, "action", Value::Int(action));\n'
+            '        self.set_object_field(event, "x", Value::Float(x));\n'
+            '        self.set_object_field(event, "y", Value::Float(y));\n'
+            '        self.run_instance_method(\n'
+            '            listener,\n'
+            '            "onTouch",\n'
+            '            vec![Value::Object(view), Value::Object(event)],\n'
+            '        )\n',
+            '        let listener = self.view_touch_listeners.get(&view).copied();\n'
+            '        let event = self.alloc_instance("Landroid/view/MotionEvent;");\n'
+            '        self.set_object_field(event, "action", Value::Int(action));\n'
+            '        self.set_object_field(event, "x", Value::Float(x));\n'
+            '        self.set_object_field(event, "y", Value::Float(y));\n'
+            '        if let Some(listener) = listener {\n'
+            '            return self.run_instance_method(\n'
+            '                listener,\n'
+            '                "onTouch",\n'
+            '                vec![Value::Object(view), Value::Object(event)],\n'
+            '            );\n'
+            '        }\n'
+            '        // views that override onTouchEvent / dispatchTouchEvent instead of registering a listener\n'
+            '        for name in ["onTouchEvent", "dispatchTouchEvent"] {\n'
+            '            if self.has_instance_method(view, name) {\n'
+            '                return self.run_instance_method(view, name, vec![Value::Object(event)]);\n'
+            '            }\n'
+            '        }\n'
+            '        Ok(Value::Int(0))\n'),
+           ('        self.canvas_stack.clear();\n'
+            '        self.canvas_state = CanvasState::default();\n'
+            '        let result = self.call_method(method_index, args);\n',
+            '        self.canvas_stack.clear();\n'
+            '        self.canvas_state = CanvasState::default();\n'
+            '        // Runnables queued by View.post / Handler.post / runOnUiThread / queueEvent run at the start of the frame\n'
+            '        let mut queued = std::mem::take(&mut self.pending_runnables);\n'
+            '        let mut rest = queued.split_off(queued.len().min(256));\n'
+            '        for runnable in queued {\n'
+            '            if let Err(error) = self.run_instance_method(runnable, "run", Vec::new()) {\n'
+            '                crate::dhlog::app_log("e", &format!("queued runnable failed: {error}"));\n'
+            '            }\n'
+            '        }\n'
+            '        rest.extend(self.pending_runnables.drain(..));\n'
+            '        self.pending_runnables = rest;\n'
+            '        let result = self.call_method(method_index, args);\n'),
+           ('        crate::dhlog::native_call(class_name, method_name);\n'
+            '        if class_name == "Landroid/util/Log;" {\n',
+            '        crate::dhlog::native_call(class_name, method_name);\n'
+            '        if class_name.starts_with("Landroid/")\n'
+            '            && matches!(\n'
+            '                method_name,\n'
+            '                "post" | "postDelayed" | "postAtTime" | "postAtFrontOfQueue" | "queueEvent" | "runOnUiThread"\n'
+            '            )\n'
+            '        {\n'
+            '            let runnable = args.iter().skip(1).find_map(|value| match value {\n'
+            '                Value::Object(id) if self.has_instance_method(*id, "run") => Some(*id),\n'
+            '                _ => None,\n'
+            '            });\n'
+            '            if let Some(runnable) = runnable {\n'
+            '                if self.pending_runnables.len() < 4096 {\n'
+            '                    self.pending_runnables.push(runnable);\n'
+            '                }\n'
+            '                return Ok(if method_name.starts_with("post") {\n'
+            '                    Value::Int(1)\n'
+            '                } else {\n'
+            '                    Value::Void\n'
+            '                });\n'
+            '            }\n'
+            '        }\n'
+            '        if class_name == "Landroid/util/Log;" {\n'),
+          ]
+          for a, b in edits:
+              if s.count(a) != 1:
+                  sys.exit('anchor missing or ambiguous (%d): %r' % (s.count(a), a[:80]))
+              s = s.replace(a, b, 1)
+          open(p, 'w').write(s)
+          print('input fix patched')
+          __DH_PY24__
+          python3 /tmp/input_fix.py
+
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
           rustup toolchain install stable --profile minimal
