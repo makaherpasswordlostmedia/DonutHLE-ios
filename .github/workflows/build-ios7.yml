@@ -4814,6 +4814,245 @@ jobs:
           __DH_PY24__
           python3 /tmp/input_fix.py
 
+      - name: Cooperative threads, SurfaceHolder callbacks and activity lifecycle (starts the game's draw thread)
+        run: |
+          set -e
+          cat > /tmp/thread_fix.py <<'__DH_PY25__'
+          # Armored Strike evidence (donuthle.log): RSLSurfaceView.runOnDrawThread only does ArrayList.add(runnable) and uses
+          # Thread.currentThread(), i.e. the game has its own draw thread that drains that list and draws via SurfaceHolder.
+          # The HLE never started that thread: no Thread.start, no onStart/onResume, no SurfaceHolder.Callback.surfaceCreated.
+          # This adds, generically:
+          #  - cooperative threads: Thread.start() registers the thread, every frame each started thread gets one slice of run();
+          #    a slice ends when run() returns (thread done) or yields (sleep/wait/yield/join/unlockCanvasAndPost/step cap)
+          #  - Thread.currentThread() returns the running thread inside a slice (so "am I on the draw thread?" checks work)
+          #  - SurfaceView.getHolder / SurfaceHolder.addCallback/lockCanvas/unlockCanvasAndPost
+          #  - after onCreate (generic boot only): onStart, onResume, surfaceCreated, surfaceChanged, onWindowFocusChanged(true)
+          import sys
+
+          def patch(p, edits, marker):
+              s = open(p).read()
+              if marker in s:
+                  print(p, 'already patched'); return
+              for a, b in edits:
+                  if s.count(a) != 1:
+                      sys.exit('anchor missing or ambiguous (%d) in %s: %r' % (s.count(a), p, a[:80]))
+                  s = s.replace(a, b, 1)
+              open(p, 'w').write(s)
+              print(p, 'patched')
+
+          patch('src/vm.rs', [
+           ('    pending_runnables: Vec<ObjectId>,\n',
+            '    pending_runnables: Vec<ObjectId>,\n'
+            '    started_threads: Vec<ObjectId>,\n'
+            '    surface_callbacks: Vec<(ObjectId, ObjectId)>,\n'
+            '    current_thread: Option<ObjectId>,\n'
+            '    in_thread_slice: bool,\n'),
+           ('            pending_runnables: Vec::new(),\n',
+            '            pending_runnables: Vec::new(),\n'
+            '            started_threads: Vec::new(),\n'
+            '            surface_callbacks: Vec::new(),\n'
+            '            current_thread: None,\n'
+            '            in_thread_slice: false,\n'),
+           ('        let result = self.call_method(method_index, args);\n'
+            '        self.frame_mode = false;\n'
+            '        result\n',
+            '        let result = self.call_method(method_index, args);\n'
+            '        self.run_thread_slices();\n'
+            '        self.frame_mode = false;\n'
+            '        result\n'),
+           ('    /// First heap instance of an app class that can be drawn',
+            '    /// One cooperative slice for every started `Thread` (threads are not real here). A slice ends when `run()` returns\n'
+            '    /// (thread finished) or when it yields (sleep/wait/yield/join/unlockCanvasAndPost or the frame step cap).\n'
+            '    fn run_thread_slices(&mut self) {\n'
+            '        let threads = std::mem::take(&mut self.started_threads);\n'
+            '        let mut alive: Vec<ObjectId> = Vec::new();\n'
+            '        for thread in threads {\n'
+            '            self.frame_steps = 0;\n'
+            '            self.frame_aborted = false;\n'
+            '            self.in_thread_slice = true;\n'
+            '            self.current_thread = Some(thread);\n'
+            '            let outcome = if self.has_instance_method(thread, "run") {\n'
+            '                Some(self.run_instance_method(thread, "run", Vec::new()))\n'
+            '            } else if let Some(target) = self.object_field_object(thread, "target") {\n'
+            '                Some(self.run_instance_method(target, "run", Vec::new()))\n'
+            '            } else {\n'
+            '                None\n'
+            '            };\n'
+            '            self.in_thread_slice = false;\n'
+            '            self.current_thread = None;\n'
+            '            match outcome {\n'
+            '                Some(Ok(_)) if self.frame_steps > self.config.max_steps => alive.push(thread),\n'
+            '                Some(Err(error)) => {\n'
+            '                    crate::dhlog::app_log("e", &format!("thread run failed: {error}"));\n'
+            '                }\n'
+            '                _ => {}\n'
+            '            }\n'
+            '        }\n'
+            '        for thread in std::mem::take(&mut self.started_threads) {\n'
+            '            if !alive.contains(&thread) {\n'
+            '                alive.push(thread);\n'
+            '            }\n'
+            '        }\n'
+            '        self.started_threads = alive;\n'
+            '        self.frame_aborted = false;\n'
+            '    }\n'
+            '\n'
+            '    /// Android\'s sequence after onCreate: onStart, onResume, SurfaceHolder callbacks (surfaceCreated + surfaceChanged)\n'
+            '    /// for views that registered one, then window focus. This is what starts draw threads / renderers.\n'
+            '    pub fn run_activity_lifecycle(&mut self, activity: ObjectId, width: i32, height: i32) {\n'
+            '        for name in ["onStart", "onResume"] {\n'
+            '            if self.has_instance_method(activity, name) {\n'
+            '                if let Err(error) = self.run_instance_method(activity, name, Vec::new()) {\n'
+            '                    crate::dhlog::app_log("e", &format!("{name} failed: {error}"));\n'
+            '                }\n'
+            '            }\n'
+            '        }\n'
+            '        for (holder, callback) in self.surface_callbacks.clone() {\n'
+            '            if self.has_instance_method(callback, "surfaceCreated") {\n'
+            '                if let Err(error) =\n'
+            '                    self.run_instance_method(callback, "surfaceCreated", vec![Value::Object(holder)])\n'
+            '                {\n'
+            '                    crate::dhlog::app_log("e", &format!("surfaceCreated failed: {error}"));\n'
+            '                }\n'
+            '            }\n'
+            '            if self.has_instance_method(callback, "surfaceChanged") {\n'
+            '                let args = vec![\n'
+            '                    Value::Object(holder),\n'
+            '                    Value::Int(4),\n'
+            '                    Value::Int(width),\n'
+            '                    Value::Int(height),\n'
+            '                ];\n'
+            '                if let Err(error) = self.run_instance_method(callback, "surfaceChanged", args) {\n'
+            '                    crate::dhlog::app_log("e", &format!("surfaceChanged failed: {error}"));\n'
+            '                }\n'
+            '            }\n'
+            '        }\n'
+            '        if self.has_instance_method(activity, "onWindowFocusChanged") {\n'
+            '            if let Err(error) =\n'
+            '                self.run_instance_method(activity, "onWindowFocusChanged", vec![Value::Int(1)])\n'
+            '            {\n'
+            '                crate::dhlog::app_log("e", &format!("onWindowFocusChanged failed: {error}"));\n'
+            '            }\n'
+            '        }\n'
+            '    }\n'
+            '\n'
+            '    /// First heap instance of an app class that can be drawn'),
+           ('        if class_name == "Landroid/util/Log;" {\n',
+            '        if self.in_thread_slice\n'
+            '            && matches!(\n'
+            '                (class_name, method_name),\n'
+            '                ("Ljava/lang/Object;", "wait")\n'
+            '                    | ("Ljava/lang/Thread;", "sleep" | "yield" | "join")\n'
+            '                    | ("Landroid/os/SystemClock;", "sleep")\n'
+            '            )\n'
+            '        {\n'
+            '            // cooperative yield: end this thread\'s slice\n'
+            '            self.frame_steps = self.config.max_steps + 1;\n'
+            '            return Ok(Value::Void);\n'
+            '        }\n'
+            '        if class_name == "Ljava/lang/Thread;" {\n'
+            '            match method_name {\n'
+            '                "<init>" => {\n'
+            '                    if let Ok(receiver) = object_arg(args, 0) {\n'
+            '                        let target = args.iter().skip(1).find_map(|value| match value {\n'
+            '                            Value::Object(id) if self.has_instance_method(*id, "run") => Some(*id),\n'
+            '                            _ => None,\n'
+            '                        });\n'
+            '                        if let Some(target) = target {\n'
+            '                            self.set_object_field(receiver, "target", Value::Object(target));\n'
+            '                        }\n'
+            '                    }\n'
+            '                    return Ok(Value::Void);\n'
+            '                }\n'
+            '                "start" => {\n'
+            '                    let thread = object_arg(args, 0)?;\n'
+            '                    if !self.started_threads.contains(&thread) {\n'
+            '                        self.started_threads.push(thread);\n'
+            '                    }\n'
+            '                    return Ok(Value::Void);\n'
+            '                }\n'
+            '                "isAlive" => {\n'
+            '                    let thread = object_arg(args, 0)?;\n'
+            '                    return Ok(Value::Int(i32::from(self.started_threads.contains(&thread))));\n'
+            '                }\n'
+            '                "currentThread" => {\n'
+            '                    if let Some(thread) = self.current_thread {\n'
+            '                        return Ok(Value::Object(thread));\n'
+            '                    }\n'
+            '                }\n'
+            '                _ => {}\n'
+            '            }\n'
+            '        }\n'
+            '        if matches!(\n'
+            '            class_name,\n'
+            '            "Landroid/view/SurfaceView;" | "Landroid/opengl/GLSurfaceView;"\n'
+            '        ) && method_name == "getHolder"\n'
+            '        {\n'
+            '            let view = object_arg(args, 0)?;\n'
+            '            let holder = match self.object_field_object(view, "surface_holder") {\n'
+            '                Some(holder) => holder,\n'
+            '                None => {\n'
+            '                    let holder = self.alloc_instance("Landroid/view/SurfaceHolder;");\n'
+            '                    self.set_object_field(holder, "owner_view", Value::Object(view));\n'
+            '                    self.set_object_field(view, "surface_holder", Value::Object(holder));\n'
+            '                    holder\n'
+            '                }\n'
+            '            };\n'
+            '            return Ok(Value::Object(holder));\n'
+            '        }\n'
+            '        if class_name == "Landroid/view/SurfaceHolder;" {\n'
+            '            match method_name {\n'
+            '                "addCallback" => {\n'
+            '                    let holder = object_arg(args, 0)?;\n'
+            '                    let callback = object_arg(args, 1)?;\n'
+            '                    if !self.surface_callbacks.contains(&(holder, callback)) {\n'
+            '                        self.surface_callbacks.push((holder, callback));\n'
+            '                    }\n'
+            '                    return Ok(Value::Void);\n'
+            '                }\n'
+            '                "removeCallback" => {\n'
+            '                    let holder = object_arg(args, 0)?;\n'
+            '                    let callback = object_arg(args, 1)?;\n'
+            '                    self.surface_callbacks.retain(|entry| *entry != (holder, callback));\n'
+            '                    return Ok(Value::Void);\n'
+            '                }\n'
+            '                "lockCanvas" => {\n'
+            '                    self.canvas_stack.clear();\n'
+            '                    self.canvas_state = CanvasState::default();\n'
+            '                    return Ok(Value::Object(self.alloc_instance("Landroid/graphics/Canvas;")));\n'
+            '                }\n'
+            '                "unlockCanvasAndPost" => {\n'
+            '                    if self.in_thread_slice {\n'
+            '                        self.frame_steps = self.config.max_steps + 1;\n'
+            '                    }\n'
+            '                    return Ok(Value::Void);\n'
+            '                }\n'
+            '                "isCreating" => return Ok(Value::Int(0)),\n'
+            '                _ => {}\n'
+            '            }\n'
+            '        }\n'
+            '        if class_name == "Landroid/util/Log;" {\n'),
+          ], 'started_threads')
+
+          patch('src/runtime.rs', [
+           ('            } else {\n'
+            '                vm.find_instance_by_class("Lde/nurogames/android/tinysanta/views/TinySantaView;")\n',
+            '            } else {\n'
+            '                if vm\n'
+            '                    .find_instance_by_class("Lde/nurogames/android/tinysanta/views/TinySantaView;")\n'
+            '                    .is_none()\n'
+            '                {\n'
+            '                    let width = vm.framework.gles.framebuffer().width().max(1) as i32;\n'
+            '                    let height = vm.framework.gles.framebuffer().height().max(1) as i32;\n'
+            '                    vm.framework.surface_size = (width, height);\n'
+            '                    crate::dhlog::phase("boot: activity lifecycle (onStart/onResume/surface callbacks)");\n'
+            '                    vm.run_activity_lifecycle(activity_object, width, height);\n'
+            '                }\n'
+            '                vm.find_instance_by_class("Lde/nurogames/android/tinysanta/views/TinySantaView;")\n'),
+          ], 'run_activity_lifecycle')
+          __DH_PY25__
+          python3 /tmp/thread_fix.py
+
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
           rustup toolchain install stable --profile minimal
