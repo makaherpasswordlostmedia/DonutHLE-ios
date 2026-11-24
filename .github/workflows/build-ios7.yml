@@ -5053,6 +5053,29 @@ jobs:
           __DH_PY25__
           python3 /tmp/thread_fix.py
 
+      - name: Object.notify/notifyAll/wait as no-ops (cooperative threads)
+        run: |
+          set -e
+          cat > /tmp/notify_fix.py <<'__DH_PY26__'
+          # donuthle.log: onStart/surfaceCreated aborted with "framework method Ljava/lang/Object;->notify is not implemented"
+          # (RSLSurfaceView$a wakes its draw thread with lock.notify()). Threads are cooperative here, so notify/notifyAll/wait
+          # are no-ops (wait inside a thread slice already yields).
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'matches!(method_name, "notify" | "notifyAll" | "wait")' in s:
+              print('notify fix already patched'); sys.exit(0)
+          a = '        if class_name == "Ljava/lang/Thread;" {\n            match method_name {\n                "<init>" => {\n'
+          if s.count(a) != 1:
+              sys.exit('anchor missing or ambiguous (%d)' % s.count(a))
+          b = ('        if class_name == "Ljava/lang/Object;" && matches!(method_name, "notify" | "notifyAll" | "wait") {\n'
+               '            return Ok(Value::Void);\n'
+               '        }\n') + a
+          open(p, 'w').write(s.replace(a, b, 1))
+          print('notify fix patched')
+          __DH_PY26__
+          python3 /tmp/notify_fix.py
+
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
           rustup toolchain install stable --profile minimal
