@@ -3866,6 +3866,631 @@ jobs:
           __DH_PY18__
           python3 /tmp/steps_fix.py
 
+      - name: Add launch diagnostics (Documents/donuthle.log, live boot status, launch timeout)
+        run: |
+          set -e
+          cat > /tmp/dhlog.rs <<'__DH_RS__'
+          //! Launch diagnostics: file log, phase tracking, VM sampling, launch timeout and a non-blocking status dump.
+          use std::collections::hash_map::DefaultHasher;
+          use std::collections::HashMap;
+          use std::ffi::{CStr, CString};
+          use std::fs::{File, OpenOptions};
+          use std::hash::{Hash, Hasher};
+          use std::io::Write;
+          use std::os::raw::c_char;
+          use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+          use std::sync::Mutex;
+          use std::time::Instant;
+
+          const RING_N: usize = 16;
+          const APP_LOG_LIMIT: usize = 400;
+
+          static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
+          static EPOCH: Mutex<Option<Instant>> = Mutex::new(None);
+          static LAUNCH_T0: Mutex<Option<Instant>> = Mutex::new(None);
+          static PHASE: Mutex<String> = Mutex::new(String::new());
+          static METHODS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+          static NATIVES: Mutex<Trace> = Mutex::new(Trace::new());
+          static STUBS: Mutex<Trace> = Mutex::new(Trace::new());
+
+          static TRACE_ON: AtomicBool = AtomicBool::new(false);
+          static LAUNCHING: AtomicBool = AtomicBool::new(false);
+          static FRAME_MODE: AtomicBool = AtomicBool::new(false);
+          static TIMEOUT_SECS: AtomicU64 = AtomicU64::new(300);
+          static STEPS: AtomicUsize = AtomicUsize::new(0);
+          static DEPTH: AtomicUsize = AtomicUsize::new(0);
+          static PC: AtomicUsize = AtomicUsize::new(0);
+          static LAST_STEPS: AtomicUsize = AtomicUsize::new(0);
+          static LAST_MS: AtomicU64 = AtomicU64::new(0);
+          static SLEEP_COUNT: AtomicU64 = AtomicU64::new(0);
+          static SLEEP_MS: AtomicU64 = AtomicU64::new(0);
+          static APP_LOGS: AtomicUsize = AtomicUsize::new(0);
+          static RING_POS: AtomicUsize = AtomicUsize::new(0);
+          #[allow(clippy::declare_interior_mutable_const)]
+          const ZERO: AtomicUsize = AtomicUsize::new(0);
+          static RING: [AtomicUsize; RING_N] = [ZERO; RING_N];
+
+          struct Trace {
+              ring: Vec<u64>,
+              pos: usize,
+              counts: Option<HashMap<u64, (String, u64)>>,
+          }
+
+          impl Trace {
+              const fn new() -> Self {
+                  Self {
+                      ring: Vec::new(),
+                      pos: 0,
+                      counts: None,
+                  }
+              }
+
+              /// Counts one call; returns the new count for this name.
+              fn hit(&mut self, class_name: &str, method_name: &str) -> u64 {
+                  let mut hasher = DefaultHasher::new();
+                  class_name.hash(&mut hasher);
+                  method_name.hash(&mut hasher);
+                  let key = hasher.finish();
+                  let counts = self.counts.get_or_insert_with(HashMap::new);
+                  let entry = counts
+                      .entry(key)
+                      .or_insert_with(|| (format!("{class_name}->{method_name}"), 0));
+                  entry.1 += 1;
+                  let count = entry.1;
+                  if self.ring.len() < RING_N {
+                      self.ring.push(key);
+                  } else {
+                      let at = self.pos % RING_N;
+                      self.ring[at] = key;
+                  }
+                  self.pos += 1;
+                  count
+              }
+
+              fn recent(&self, limit: usize) -> String {
+                  let Some(counts) = self.counts.as_ref() else {
+                      return String::new();
+                  };
+                  let mut out = Vec::new();
+                  for i in 0..limit.min(self.ring.len()) {
+                      let at = (self.pos + RING_N * 2 - 1 - i) % RING_N;
+                      if let Some(key) = self.ring.get(at) {
+                          if let Some((name, _)) = counts.get(key) {
+                              out.push(name.clone());
+                          }
+                      }
+                  }
+                  out.join(" <- ")
+              }
+
+              fn top(&self, limit: usize) -> String {
+                  let Some(counts) = self.counts.as_ref() else {
+                      return String::new();
+                  };
+                  let mut all: Vec<&(String, u64)> = counts.values().collect();
+                  all.sort_by(|a, b| b.1.cmp(&a.1));
+                  all.iter()
+                      .take(limit)
+                      .map(|(name, count)| format!("{name} x{count}"))
+                      .collect::<Vec<_>>()
+                      .join(", ")
+              }
+          }
+
+          fn now_ms() -> u64 {
+              match EPOCH.try_lock() {
+                  Ok(guard) => guard
+                      .as_ref()
+                      .map(|t| t.elapsed().as_millis() as u64)
+                      .unwrap_or(0),
+                  Err(_) => 0,
+              }
+          }
+
+          fn launch_secs() -> u64 {
+              match LAUNCH_T0.try_lock() {
+                  Ok(guard) => guard.as_ref().map(|t| t.elapsed().as_secs()).unwrap_or(0),
+                  Err(_) => 0,
+              }
+          }
+
+          fn write_line(msg: &str, blocking: bool) {
+              let t = now_ms();
+              let guard = if blocking {
+                  LOG_FILE.lock().ok()
+              } else {
+                  LOG_FILE.try_lock().ok()
+              };
+              if let Some(mut guard) = guard {
+                  if let Some(file) = guard.as_mut() {
+                      let _ = writeln!(file, "[{:>8.3}] {}", t as f64 / 1000.0, msg);
+                  }
+              }
+          }
+
+          pub fn log(msg: &str) {
+              write_line(msg, true);
+          }
+
+          pub fn phase(name: &str) {
+              if let Ok(mut phase) = PHASE.lock() {
+                  *phase = name.to_owned();
+              }
+              write_line(
+                  &format!(
+                      "PHASE {name} (steps={}, launch={}s)",
+                      STEPS.load(Ordering::Relaxed),
+                      launch_secs()
+                  ),
+                  true,
+              );
+          }
+
+          pub fn set_methods(names: Vec<String>) {
+              if let Ok(mut methods) = METHODS.lock() {
+                  *methods = names;
+              }
+          }
+
+          pub fn launch_begin(path: &str) {
+              if let Ok(mut t) = LAUNCH_T0.lock() {
+                  *t = Some(Instant::now());
+              }
+              for counter in [&STEPS, &DEPTH, &PC, &LAST_STEPS, &APP_LOGS, &RING_POS] {
+                  counter.store(0, Ordering::Relaxed);
+              }
+              LAST_MS.store(0, Ordering::Relaxed);
+              SLEEP_COUNT.store(0, Ordering::Relaxed);
+              SLEEP_MS.store(0, Ordering::Relaxed);
+              if let Ok(mut t) = NATIVES.lock() {
+                  *t = Trace::new();
+              }
+              if let Ok(mut t) = STUBS.lock() {
+                  *t = Trace::new();
+              }
+              set_methods(Vec::new());
+              TRACE_ON.store(true, Ordering::Relaxed);
+              LAUNCHING.store(true, Ordering::Relaxed);
+              phase(&format!(
+                  "launch begin: {path} (timeout {}s)",
+                  TIMEOUT_SECS.load(Ordering::Relaxed)
+              ));
+          }
+
+          pub fn launch_end(error: Option<String>) {
+              LAUNCHING.store(false, Ordering::Relaxed);
+              TRACE_ON.store(false, Ordering::Relaxed);
+              match error {
+                  Some(error) => write_line(
+                      &format!("LAUNCH FAILED after {}s: {error}", launch_secs()),
+                      true,
+                  ),
+                  None => write_line(&format!("LAUNCH OK after {}s", launch_secs()), true),
+              }
+              write_line(&full_status(), true);
+          }
+
+          #[inline]
+          pub fn enter(method_index: usize) {
+              let at = RING_POS.fetch_add(1, Ordering::Relaxed);
+              RING[at % RING_N].store(method_index, Ordering::Relaxed);
+          }
+
+          /// Called every 65536 interpreter steps. `Some(message)` asks the VM to abort the launch.
+          pub fn tick(steps: usize, depth: usize, pc: usize, frame_mode: bool) -> Option<String> {
+              STEPS.store(steps, Ordering::Relaxed);
+              DEPTH.store(depth, Ordering::Relaxed);
+              PC.store(pc, Ordering::Relaxed);
+              FRAME_MODE.store(frame_mode, Ordering::Relaxed);
+              if !LAUNCHING.load(Ordering::Relaxed) {
+                  return None;
+              }
+              let limit = TIMEOUT_SECS.load(Ordering::Relaxed);
+              if limit == 0 {
+                  return None;
+              }
+              let elapsed = launch_secs();
+              if elapsed < limit {
+                  return None;
+              }
+              let message = format!(
+                  "launch timed out after {elapsed}s ({steps} steps). {} Set NSUserDefaults 'launchtimeout' (seconds, 0 = off) to change.",
+                  short_status()
+              );
+              write_line(&message, true);
+              Some(message)
+          }
+
+          pub fn native_call(class_name: &str, method_name: &str) {
+              if !TRACE_ON.load(Ordering::Relaxed) {
+                  return;
+              }
+              if let Ok(mut t) = NATIVES.lock() {
+                  t.hit(class_name, method_name);
+              }
+          }
+
+          pub fn auto_stub(class_name: &str, method_name: &str) {
+              let count = match STUBS.lock() {
+                  Ok(mut t) => t.hit(class_name, method_name),
+                  Err(_) => return,
+              };
+              // log the first hit and every power of ten after it
+              let mut p = 1u64;
+              while p < count {
+                  p = p.saturating_mul(10);
+              }
+              if count == p {
+                  write_line(&format!("auto-stub {class_name}->{method_name} x{count}"), true);
+              }
+          }
+
+          pub fn sleep_note(ms: u64, frame_mode: bool) {
+              let n = SLEEP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+              SLEEP_MS.fetch_add(ms, Ordering::Relaxed);
+              if !frame_mode && n <= 10 {
+                  write_line(&format!("Thread.sleep({ms}) during launch (call #{n})"), true);
+              }
+          }
+
+          pub fn app_log(kind: &str, message: &str) {
+              let n = APP_LOGS.fetch_add(1, Ordering::Relaxed);
+              if n < APP_LOG_LIMIT {
+                  let cut: String = message.chars().take(300).collect();
+                  write_line(&format!("app Log/{kind}: {cut}"), true);
+              }
+          }
+
+          fn method_name(index: usize, names: &[String]) -> String {
+              names
+                  .get(index)
+                  .cloned()
+                  .unwrap_or_else(|| format!("#{index}"))
+          }
+
+          fn recent_methods(limit: usize) -> String {
+              let pos = RING_POS.load(Ordering::Relaxed);
+              let Ok(names) = METHODS.try_lock() else {
+                  return String::new();
+              };
+              let mut out = Vec::new();
+              for i in 0..limit.min(pos).min(RING_N) {
+                  let at = (pos - 1 - i) % RING_N;
+                  out.push(method_name(RING[at].load(Ordering::Relaxed), &names));
+              }
+              out.join(" <- ")
+          }
+
+          fn phase_name() -> String {
+              PHASE.try_lock().map(|p| p.clone()).unwrap_or_default()
+          }
+
+          pub fn short_status() -> String {
+              let natives = NATIVES
+                  .try_lock()
+                  .map(|t| t.recent(2))
+                  .unwrap_or_default();
+              format!(
+                  "phase: {}\nsteps: {} depth: {}\nmethods: {}\nnative: {}",
+                  phase_name(),
+                  STEPS.load(Ordering::Relaxed),
+                  DEPTH.load(Ordering::Relaxed),
+                  recent_methods(3),
+                  natives
+              )
+          }
+
+          pub fn full_status() -> String {
+              let steps = STEPS.load(Ordering::Relaxed);
+              let ms = now_ms();
+              let prev_steps = LAST_STEPS.swap(steps, Ordering::Relaxed);
+              let prev_ms = LAST_MS.swap(ms, Ordering::Relaxed);
+              let rate = if ms > prev_ms {
+                  (steps.saturating_sub(prev_steps) as u64) * 1000 / (ms - prev_ms)
+              } else {
+                  0
+              };
+              let (recent, top) = match NATIVES.try_lock() {
+                  Ok(t) => (t.recent(RING_N), t.top(8)),
+                  Err(_) => (String::new(), String::new()),
+              };
+              let stubs = STUBS.try_lock().map(|t| t.top(6)).unwrap_or_default();
+              format!(
+                  "STATUS phase={} launching={} launch={}s steps={} ({} steps/s) depth={} pc={} frame_mode={}\n  last methods: {}\n  last natives: {}\n  top natives: {}\n  top auto-stubs: {}\n  sleeps: {} calls / {} ms; app logs: {}",
+                  phase_name(),
+                  LAUNCHING.load(Ordering::Relaxed),
+                  launch_secs(),
+                  steps,
+                  rate,
+                  DEPTH.load(Ordering::Relaxed),
+                  PC.load(Ordering::Relaxed),
+                  FRAME_MODE.load(Ordering::Relaxed),
+                  recent_methods(RING_N),
+                  recent,
+                  top,
+                  stubs,
+                  SLEEP_COUNT.load(Ordering::Relaxed),
+                  SLEEP_MS.load(Ordering::Relaxed),
+                  APP_LOGS.load(Ordering::Relaxed)
+              )
+          }
+
+          /// # Safety
+          ///
+          /// `path` must be a valid NUL-terminated C string.
+          #[no_mangle]
+          pub unsafe extern "C" fn donuthle_log_open(path: *const c_char) -> i32 {
+              if path.is_null() {
+                  return 0;
+              }
+              let Ok(path) = CStr::from_ptr(path).to_str() else {
+                  return 0;
+              };
+              let Ok(file) = OpenOptions::new().create(true).append(true).open(path) else {
+                  return 0;
+              };
+              if let Ok(mut t) = EPOCH.lock() {
+                  *t = Some(Instant::now());
+              }
+              if let Ok(mut f) = LOG_FILE.lock() {
+                  *f = Some(file);
+              }
+              std::panic::set_hook(Box::new(|info| {
+                  write_line(&format!("PANIC: {info}"), false);
+                  write_line(&full_status(), false);
+              }));
+              write_line("log opened", true);
+              1
+          }
+
+          /// # Safety
+          ///
+          /// `msg` must be a valid NUL-terminated C string.
+          #[no_mangle]
+          pub unsafe extern "C" fn donuthle_log_write(msg: *const c_char) {
+              if msg.is_null() {
+                  return;
+              }
+              log(&CStr::from_ptr(msg).to_string_lossy());
+          }
+
+          /// Short status for on-screen display. Free with `donuthle_free_string`.
+          #[no_mangle]
+          pub extern "C" fn donuthle_log_status() -> *mut c_char {
+              CString::new(short_status().replace('\0', " "))
+                  .unwrap_or_default()
+                  .into_raw()
+          }
+
+          /// Writes the full status block to the log file.
+          #[no_mangle]
+          pub extern "C" fn donuthle_log_dump() {
+              write_line(&full_status(), false);
+          }
+
+          /// Launch timeout in seconds, 0 disables it. Default 300.
+          #[no_mangle]
+          pub extern "C" fn donuthle_set_launch_timeout(secs: u32) {
+              TIMEOUT_SECS.store(u64::from(secs), Ordering::Relaxed);
+          }
+          __DH_RS__
+          cat > /tmp/dhlog_fix.py <<'__DH_PY19__'
+          # Launch diagnostics: writes src/dhlog.rs and hooks it into the (already patched) core + iOS shell.
+          # Log file: Documents/donuthle.log (previous run: donuthle.prev.log). Safe to run twice.
+          import sys, os
+
+          def patch(path, edits, marker):
+              s = open(path).read()
+              if marker in s:
+                  print(path + ': already patched'); return
+              for a, b in edits:
+                  if s.count(a) != 1:
+                      sys.exit('%s: anchor missing or ambiguous (%d): %r' % (path, s.count(a), a[:70]))
+                  s = s.replace(a, b, 1)
+              open(path, 'w').write(s)
+              print(path + ': patched')
+
+          DHLOG_RS = open('/tmp/dhlog.rs').read() if os.path.exists('/tmp/dhlog.rs') else None
+          if DHLOG_RS is None:
+              sys.exit('missing /tmp/dhlog.rs')
+          open('src/dhlog.rs', 'w').write(DHLOG_RS)
+          print('src/dhlog.rs written')
+
+          patch('src/lib.rs', [
+              ('pub mod compat;\n', 'pub mod compat;\npub mod dhlog;\n'),
+              ('                let mut runtime = runtime::Runtime::default();\n                match runtime.launch(path) {\n',
+               '                crate::dhlog::launch_begin(path);\n'
+               '                let mut runtime = runtime::Runtime::default();\n'
+               '                let launched = runtime.launch(path);\n'
+               '                crate::dhlog::launch_end(launched.as_ref().err().map(|e| format!("{e:#}")));\n'
+               '                match launched {\n'),
+          ], 'crate::dhlog::launch_begin')
+
+          patch('src/assets.rs', [
+              ('        let mut store = Self::default();\n        for index in 0..archive.len() {\n',
+               '        let mut store = Self::default();\n'
+               '        let mut dh_total: usize = 0;\n'
+               '        crate::dhlog::phase(&format!("assets: reading {} apk entries into memory", archive.len()));\n'
+               '        for index in 0..archive.len() {\n'),
+              ('            entry.read_to_end(&mut bytes)?;\n            store.files.insert(key, bytes);\n',
+               '            entry.read_to_end(&mut bytes)?;\n'
+               '            dh_total += bytes.len();\n'
+               '            if bytes.len() > 4 * 1024 * 1024 {\n'
+               '                crate::dhlog::log(&format!("asset entry {} = {} bytes (total {})", name, bytes.len(), dh_total));\n'
+               '            }\n'
+               '            store.files.insert(key, bytes);\n'),
+              ('        store.index_atlases();\n        Ok(store)\n',
+               '        crate::dhlog::phase(&format!("assets: read done, {dh_total} bytes in memory; indexing atlases"));\n'
+               '        store.index_atlases();\n'
+               '        crate::dhlog::phase("assets: atlases indexed");\n'
+               '        Ok(store)\n'),
+          ], 'dh_total')
+
+          patch('src/runtime.rs', [
+              ('        let plan = self.launch_plan(path)?;\n        self.game_title = plan',
+               '        crate::dhlog::phase("launch_plan: opening apk, parsing manifest/dex/resources/assets");\n'
+               '        let plan = self.launch_plan(path)?;\n'
+               '        crate::dhlog::phase(&format!(\n'
+               '            "launch_plan done: package={} activity={} classes={} methods={} entry_onCreate={}",\n'
+               '            plan.package,\n            plan.activity,\n            plan.dex.classes.len(),\n            plan.dex.methods.len(),\n            plan.entry_method\n        ));\n'
+               '        self.game_title = plan'),
+              ('        let state = self.boot(&plan)?;\n',
+               '        crate::dhlog::phase("boot: start (assets.clone + dex.clone follow)");\n        let state = self.boot(&plan)?;\n'),
+              ("            let dex: &'static DexFile = Box::leak(Box::new(plan.dex.clone()));\n",
+               "            let dex: &'static DexFile = Box::leak(Box::new(plan.dex.clone()));\n"
+               '            crate::dhlog::set_methods(\n'
+               '                dex.methods\n                    .iter()\n'
+               '                    .map(|m| format!("{}->{}", m.class_name, m.name))\n                    .collect(),\n            );\n'
+               '            crate::dhlog::phase("boot: dex cloned, method table ready");\n'),
+              ('            let activity_object = vm.alloc_instance(plan.class_name.clone());\n',
+               '            crate::dhlog::phase(&format!("boot: running {}.onCreate", plan.class_name));\n'
+               '            let activity_object = vm.alloc_instance(plan.class_name.clone());\n'),
+              ('            let listener = vm\n                .framework\n                .gdx_listener\n',
+               '            crate::dhlog::phase("boot: onCreate returned");\n'
+               '            let listener = vm\n                .framework\n                .gdx_listener\n'),
+              ('                vm.run_instance_method(listener, "create", Vec::new())\n',
+               '                crate::dhlog::phase("boot: ApplicationListener.create()");\n'
+               '                vm.run_instance_method(listener, "create", Vec::new())\n'),
+              ('            let mut session = RuntimeSession { vm, listener };\n',
+               '            crate::dhlog::phase("boot: listener ready, rendering first frame");\n'
+               '            let mut session = RuntimeSession { vm, listener };\n'),
+              ('            let (commands, pixels) = session.render_current_frame()?;\n',
+               '            let (commands, pixels) = session.render_current_frame()?;\n'
+               '            crate::dhlog::phase(&format!("boot: first frame done, commands={commands}"));\n'),
+          ], 'boot: dex cloned')
+
+          patch('src/vm.rs', [
+              ('    fn call_method(&mut self, method_index: usize, args: Vec<Value>) -> Result<Value, VmError> {\n',
+               '    fn call_method(&mut self, method_index: usize, args: Vec<Value>) -> Result<Value, VmError> {\n'
+               '        crate::dhlog::enter(method_index);\n'),
+              ('            self.executed_steps += 1;\n            if self.frame_mode {',
+               '            self.executed_steps += 1;\n'
+               '            if self.executed_steps & 0xFFFF == 0 {\n'
+               '                if let Some(message) = crate::dhlog::tick(\n'
+               '                    self.executed_steps,\n                    self.call_depth,\n                    pc,\n                    self.frame_mode,\n'
+               '                ) {\n'
+               '                    return Err(self.error(pc, 0, message));\n'
+               '                }\n'
+               '            }\n'
+               '            if self.frame_mode {'),
+              ('    fn dispatch_framework(\n        &mut self,\n        class_name: &str,\n        method_name: &str,\n        args: &[Value],\n    ) -> Result<Value, VmError> {\n',
+               '    fn dispatch_framework(\n        &mut self,\n        class_name: &str,\n        method_name: &str,\n        args: &[Value],\n    ) -> Result<Value, VmError> {\n'
+               '        crate::dhlog::native_call(class_name, method_name);\n'),
+              ('    fn dispatch_gdx(\n        &mut self,\n        class_name: &str,\n        method_name: &str,\n        args: &[Value],\n    ) -> Result<Value, VmError> {\n',
+               '    fn dispatch_gdx(\n        &mut self,\n        class_name: &str,\n        method_name: &str,\n        args: &[Value],\n    ) -> Result<Value, VmError> {\n'
+               '        crate::dhlog::native_call(class_name, method_name);\n'),
+              ('                self.framework\n                    .logs\n                    .push(format!("Log/{method_name}: {message}"));\n',
+               '                if self.framework.logs.len() < 5000 {\n'
+               '                    self.framework\n                        .logs\n                        .push(format!("Log/{method_name}: {message}"));\n'
+               '                }\n'
+               '                crate::dhlog::app_log(method_name, message);\n'),
+              ('                std::thread::sleep(std::time::Duration::from_millis(delay as u64));\n',
+               '                crate::dhlog::sleep_note(delay as u64, self.frame_mode);\n'
+               '                std::thread::sleep(std::time::Duration::from_millis(delay as u64));\n'),
+              ('            self.framework\n                .logs\n                .push(format!("auto-stub {class_name}->{method_name}"));\n            eprintln!("DonutHLE: auto-stub {class_name}->{method_name}");\n',
+               '            if self.framework.logs.len() < 5000 {\n'
+               '                self.framework\n                    .logs\n                    .push(format!("auto-stub {class_name}->{method_name}"));\n'
+               '            }\n'
+               '            crate::dhlog::auto_stub(class_name, method_name);\n'),
+          ], 'crate::dhlog::enter')
+
+          patch('ios/DHBridge.h', [
+              ('void donuthle_set_auto_stub(int32_t enabled);\n',
+               'void donuthle_set_auto_stub(int32_t enabled);\n'
+               'int32_t donuthle_log_open(const char *path);\n'
+               'void donuthle_log_write(const char *msg);\n'
+               'char *donuthle_log_status(void);\n'
+               'void donuthle_log_dump(void);\n'
+               'void donuthle_set_launch_timeout(uint32_t secs);\n'),
+          ], 'donuthle_log_open')
+
+          patch('ios/DHRunner.m', [
+              ('#import "DHBridge.h"\n', '#import "DHBridge.h"\n#import <UIKit/UIKit.h>\n#include <sys/utsname.h>\n#include <stdio.h>\n'),
+              ('donuthle_set_auto_stub(self.autoStub ? 1 : 0);\n',
+               'donuthle_set_auto_stub(self.autoStub ? 1 : 0);\n'
+               '        {   // diagnostics: Documents/donuthle.log (previous run kept as donuthle.prev.log); stderr goes there too\n'
+               '            NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;\n'
+               '            NSString *logPath = [docs stringByAppendingPathComponent:@"donuthle.log"];\n'
+               '            NSString *prevPath = [docs stringByAppendingPathComponent:@"donuthle.prev.log"];\n'
+               '            NSFileManager *fm = [NSFileManager defaultManager];\n'
+               '            [fm removeItemAtPath:prevPath error:nil];\n'
+               '            [fm moveItemAtPath:logPath toPath:prevPath error:nil];\n'
+               '            donuthle_log_open([logPath fileSystemRepresentation]);\n'
+               '            freopen([logPath fileSystemRepresentation], "a", stderr);\n'
+               '            setvbuf(stderr, NULL, _IONBF, 0);\n'
+               '            struct utsname u; uname(&u);\n'
+               '            NSDictionary *at = [fm attributesOfItemAtPath:_path error:nil];\n'
+               '            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];\n'
+               '            if ([ud objectForKey:@"launchtimeout"]) donuthle_set_launch_timeout((uint32_t)[ud integerForKey:@"launchtimeout"]);\n'
+               '            NSString *info = [NSString stringWithFormat:@"device=%s ios=%@ ram=%lluMB apk=%@ (%llu bytes) gpu=%d autostub=%d",\n'
+               '                u.machine, [[UIDevice currentDevice] systemVersion], (unsigned long long)([NSProcessInfo processInfo].physicalMemory / 1048576),\n'
+               '                [_path lastPathComponent], (unsigned long long)[at fileSize], self.gpu, self.autoStub];\n'
+               '            donuthle_log_write([info UTF8String]);\n'
+               '        }\n'),
+              ('BOOL failed = [report hasPrefix:@"Runtime error"];\n',
+               'BOOL failed = [report hasPrefix:@"Runtime error"];\n'
+               '        donuthle_log_write([[NSString stringWithFormat:@"launch_report returned (failed=%d): %@", failed, [report substringToIndex:MIN(report.length, (NSUInteger)800)]] UTF8String]);\n'),
+          ], 'donuthle_log_open')
+
+          patch('ios/DHGameViewController.m', [
+              ('    UILabel *_status;\n}', '    UILabel *_status;\n    NSTimer *_watch;\n    NSTimeInterval _bootT0;\n    int _watchN;\n}'),
+              ('    [_runner start];\n}\n',
+               '    _bootT0 = [NSDate timeIntervalSinceReferenceDate];\n'
+               '    _status.numberOfLines = 0;\n'
+               '    _status.font = [UIFont systemFontOfSize:11];\n'
+               '    _watch = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(watchTick:) userInfo:nil repeats:YES];\n'
+               '    [_runner start];\n}\n\n'
+               '// Live boot status on screen; every 3rd second the full status block also goes to Documents/donuthle.log.\n'
+               '- (void)watchTick:(NSTimer *)t {\n'
+               '    char *s = donuthle_log_status();\n'
+               '    NSString *st = s ? [NSString stringWithUTF8String:s] : @"";\n'
+               '    if (s) donuthle_free_string(s);\n'
+               '    _status.text = [NSString stringWithFormat:@"Booting\\u2026 %.0fs\\n\\n%@", [NSDate timeIntervalSinceReferenceDate] - _bootT0, st];\n'
+               '    if (++_watchN % 3 == 0) donuthle_log_dump();\n'
+               '}\n'),
+              ('    _status.hidden = YES;\n',
+               '    [_watch invalidate]; _watch = nil;\n'
+               '    donuthle_log_write("main thread: launch result received");\n'
+               '    _status.hidden = YES;\n'),
+              ('    [super viewWillDisappear:animated];\n',
+               '    [super viewWillDisappear:animated];\n    [_watch invalidate]; _watch = nil;\n'),
+              ('message:report delegate:self',
+               'message:[report stringByAppendingString:@"\\n\\nLog: Documents/donuthle.log"] delegate:self'),
+          ], '_watchN')
+          __DH_PY19__
+          python3 /tmp/dhlog_fix.py
+
+      - name: Speed up VM calls (no per-call MethodId/CodeItem clones)
+        run: |
+          set -e
+          cat > /tmp/speed_fix.py <<'__DH_PY20__'
+          # VM call speed-up: stop deep-cloning MethodId (3 Strings) and CodeItem (whole instruction vector) on every call.
+          # `self.dex` is a shared `&'a DexFile`, so copying the reference out lets us borrow code/method without cloning
+          # while still calling `&mut self` methods.
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'dh_dex' in s:
+              print('speed fix already patched'); sys.exit(0)
+          edits = [
+           ('        let method = self\n            .dex\n            .method_id(method_index)\n            .ok_or_else(|| self.error(0, 0, format!("method index {method_index} is invalid")))?\n            .clone();\n',
+            '        let dh_dex: &\'a DexFile = self.dex;\n        let method = dh_dex\n            .method_id(method_index)\n            .ok_or_else(|| self.error(0, 0, format!("method index {method_index} is invalid")))?;\n'),
+           ('            if let Some(code) = self.dex.method_code_by_index(method_index).cloned() {\n                self.call_depth += 1;\n                let result = self.execute_code(&code, args);\n',
+            '            if let Some(code) = dh_dex.method_code_by_index(method_index) {\n                self.call_depth += 1;\n                let result = self.execute_code(code, args);\n'),
+           ('        let code = match self.dex.method_code_by_index(method_index) {\n            Some(code) => code.clone(),\n',
+            '        let code = match dh_dex.method_code_by_index(method_index) {\n            Some(code) => code,\n'),
+           ('        let result = self.execute_code(&code, args);\n        self.call_depth -= 1;\n        if is_render_method {',
+            '        let result = self.execute_code(code, args);\n        self.call_depth -= 1;\n        if is_render_method {'),
+          ]
+          for a, b in edits:
+              if s.count(a) != 1:
+                  sys.exit('anchor missing or ambiguous (%d): %r' % (s.count(a), a[:70]))
+              s = s.replace(a, b, 1)
+          open(p, 'w').write(s)
+          print('speed fix patched')
+          __DH_PY20__
+          python3 /tmp/speed_fix.py
+
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
           rustup toolchain install stable --profile minimal
