@@ -3,6 +3,7 @@ name: Build DonutHLE iOS 7 (armv7)
 # SINGLE-FILE PORT: drop only this file into .github/workflows/ of an unmodified DonutHLE checkout and run it.
 # It writes the whole ios/ app (Theos shell, target spec, shims) and patches the Rust core by itself:
 #   - GPU op-stream recording in gles.rs + runtime.rs/lib.rs FFI (donuthle_gpu_*), VM natives for alpha/cull/fog/tex-env
+#   - Dalvik fixes: instance-of width, goto/32, packed/sparse-switch (fixes "register v56 is outside the frame")
 #   - slice::as_chunks compat (the crate needs Rust 1.88 otherwise), zip without C-dependent features
 # Then: Rust staticlib for armv7-apple-ios7 (-Zbuild-std) + Theos app, cross-compiled on Linux. Outputs .ipa and .deb.
 # Toolchain/SDK steps follow ioskvm's ios.yml (Theos + L1ghtmann vanilla clang + iPhoneOS 9.3 SDK).
@@ -4549,6 +4550,37 @@ jobs:
           print('speed fix patched')
           __DH_PY20__
           python3 /tmp/speed_fix.py
+
+      - name: Fix Dalvik instruction widths (instance-of, goto/32) and add packed/sparse-switch
+        run: |
+          set -e
+          cat > /tmp/width_fix.py <<'__DH_PY22__'
+          # Dalvik width/decoding fixes found via "register v56 is outside the frame" in ArmoredStrike.switchToWindow:
+          #  - 0x20 instance-of is format 22c (2 code units, vA|vB nibbles); VM advanced pc by 1 and read dest as 8 bits,
+          #    so the next instruction was decoded from the middle of the previous one (bogus `and-int/lit8 .., v56`).
+          #  - 0x2a goto/32 reads a 32-bit offset (3 code units), VM read only 16 bits.
+          #  - 0x2b packed-switch / 0x2c sparse-switch were not implemented at all.
+          import sys
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if '0x2b | 0x2c => {' in s:
+              print('dalvik width fix already patched'); sys.exit(0)
+          edits = [
+           ('                0x20 => {\n                    let dest = ((instruction >> 8) & 0xff) as usize;\n                    let source = ((instruction >> 12) & 0x0f) as usize;',
+            '                0x20 => {\n                    let dest = ((instruction >> 8) & 0x0f) as usize;\n                    let source = ((instruction >> 12) & 0x0f) as usize;'),
+           ('                    pc += 1;\n                }\n                0x21 => {',
+            '                    pc += 2;\n                }\n                0x21 => {'),
+           ('                0x2a => {\n                    let offset = code_word(code, pc + 1, pc, opcode)? as i16 as i32;\n                    pc = branch_target(pc, offset, code.instructions.len(), pc, opcode)?;\n                }\n',
+            '                0x2a => {\n                    let low = code_word(code, pc + 1, pc, opcode)? as u32;\n                    let high = code_word(code, pc + 2, pc, opcode)? as u32;\n                    let offset = (low | high << 16) as i32;\n                    pc = branch_target(pc, offset, code.instructions.len(), pc, opcode)?;\n                }\n                0x2b | 0x2c => {\n                    let register = ((instruction >> 8) & 0xff) as usize;\n                    let value =\n                        as_int(get_register(&registers, register, pc, opcode)?, pc, opcode)?;\n                    let low = code_word(code, pc + 1, pc, opcode)? as u32;\n                    let high = code_word(code, pc + 2, pc, opcode)? as u32;\n                    let payload = branch_target(\n                        pc,\n                        (low | high << 16) as i32,\n                        code.instructions.len(),\n                        pc,\n                        opcode,\n                    )?;\n                    let ident = code_word(code, payload, pc, opcode)?;\n                    let size = code_word(code, payload + 1, pc, opcode)? as usize;\n                    let mut jump: Option<i32> = None;\n                    let read_i32 = |at: usize| -> Result<i32, VmError> {\n                        let lo = code_word(code, at, pc, opcode)? as u32;\n                        let hi = code_word(code, at + 1, pc, opcode)? as u32;\n                        Ok((lo | hi << 16) as i32)\n                    };\n                    if opcode == 0x2b {\n                        if ident != 0x0100 {\n                            return Err(self.error(pc, opcode, "packed-switch payload is invalid"));\n                        }\n                        let first = read_i32(payload + 2)?;\n                        let diff = i64::from(value) - i64::from(first);\n                        if diff >= 0 && (diff as usize) < size {\n                            jump = Some(read_i32(payload + 4 + diff as usize * 2)?);\n                        }\n                    } else {\n                        if ident != 0x0200 {\n                            return Err(self.error(pc, opcode, "sparse-switch payload is invalid"));\n                        }\n                        for entry in 0..size {\n                            if read_i32(payload + 2 + entry * 2)? == value {\n                                jump = Some(read_i32(payload + 2 + size * 2 + entry * 2)?);\n                                break;\n                            }\n                        }\n                    }\n                    match jump {\n                        Some(offset) => {\n                            pc = branch_target(pc, offset, code.instructions.len(), pc, opcode)?;\n                        }\n                        None => pc += 3,\n                    }\n                }\n'),
+          ]
+          for a, b in edits:
+              if s.count(a) != 1:
+                  sys.exit('anchor missing or ambiguous (%d): %r' % (s.count(a), a[:70]))
+              s = s.replace(a, b, 1)
+          open(p, 'w').write(s)
+          print('dalvik width fix patched')
+          __DH_PY22__
+          python3 /tmp/width_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
