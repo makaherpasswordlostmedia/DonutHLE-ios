@@ -7,6 +7,7 @@ name: Build DonutHLE iOS 7 (armv7)
 #   - Dalvik fixes: instance-of width, goto/32, packed/sparse-switch (fixes "register v56 is outside the frame")
 #   - Better logs in donuthle.log: VM ERROR reports (phase, Dalvik stack at failure, recent calls), repeat collapsing, swallowed errors reported
 #   - GLSurfaceView.Renderer games (Armored Strike): setRenderer capture, javax GL10/GL11 -> GLES backend, onSurfaceCreated/Changed, black-frame log
+#   - Draw-thread diagnostics: donuthle.log gets "SLICE #n" lines (methods + natives each draw-thread slice ran), bigger slice budget, thread survives errors, view lifecycle (onAttachedToWindow/onSizeChanged/focus), accurate BLACK FRAME detection
 #   - slice::as_chunks compat (the crate needs Rust 1.88 otherwise), zip without C-dependent features
 # Then: Rust staticlib for armv7-apple-ios7 (-Zbuild-std) + Theos app, cross-compiled on Linux. Outputs .ipa and .deb.
 # Toolchain/SDK steps follow ioskvm's ios.yml (Theos + L1ghtmann vanilla clang + iPhoneOS 9.3 SDK).
@@ -5361,6 +5362,339 @@ jobs:
           rw('src/lib.rs', lib)
           __DH_PY28__
           python3 /tmp/log_fix.py
+
+      - name: Draw-thread diagnostics (SLICE trace in donuthle.log), draw-thread resilience, view lifecycle, black-frame detector
+        run: |
+          set -e
+          cat > /tmp/slice_fix.py <<'__DH_PY29__'
+          # Draw-thread diagnostics + resilience (Armored Strike: black screen, draw thread loops without issuing GL/Canvas calls).
+          #  - dhlog: ring buffers 16 -> 512 entries; per-slice trace (first 6 slices, then every 600th) written to donuthle.log as
+          #    "SLICE #n: <outcome>" + the DEX methods and framework natives that slice executed (repeats collapsed)
+          #  - thread slices: bigger step budget (10x for the first 20 slices, 2x afterwards) so one-time init work on the draw thread
+          #    is not cut in half by the per-frame cap; a failing run() no longer kills the thread for good (up to 300 errors)
+          #  - view lifecycle: onAttachedToWindow / onWindowVisibilityChanged / onSizeChanged / onWindowFocusChanged on the content
+          #    view before the SurfaceHolder callbacks (games gate their draw loop on these)
+          #  - black-frame detector: begin_frame() already counts 1 command, so 0 never happened; "<= 1" means nothing was drawn
+          import sys
+
+          def patch(p, edits, marker):
+              s = open(p).read()
+              if marker in s:
+                  print(p, 'already patched'); return
+              for a, b in edits:
+                  if s.count(a) != 1:
+                      sys.exit('anchor missing or ambiguous (%d) in %s: %r' % (s.count(a), p, a[:90]))
+                  s = s.replace(a, b, 1)
+              open(p, 'w').write(s)
+              print(p, 'patched')
+
+          patch('src/dhlog.rs', [
+           ('const RING_N: usize = 16;', 'const RING_N: usize = 512;'),
+           ('    fn top(&self, limit: usize) -> String {',
+            """    /// Names recorded since ring position `from` (at most `limit`, oldest first, repeats collapsed).
+              fn since(&self, from: usize, limit: usize) -> String {
+                  let Some(counts) = self.counts.as_ref() else {
+                      return String::new();
+                  };
+                  let start = from
+                      .max(self.pos.saturating_sub(RING_N))
+                      .max(self.pos.saturating_sub(limit));
+                  let mut runs: Vec<(String, u32)> = Vec::new();
+                  for k in start..self.pos {
+                      let Some(key) = self.ring.get(k % RING_N) else {
+                          continue;
+                      };
+                      let Some((name, _)) = counts.get(key) else {
+                          continue;
+                      };
+                      let name = short_name(name);
+                      let same = matches!(runs.last(), Some((last, _)) if *last == name);
+                      if same {
+                          if let Some(entry) = runs.last_mut() {
+                              entry.1 += 1;
+                          }
+                      } else {
+                          runs.push((name, 1));
+                      }
+                  }
+                  runs.iter()
+                      .map(|(name, count)| {
+                          if *count > 1 {
+                              format!("{name} x{count}")
+                          } else {
+                              name.clone()
+                          }
+                      })
+                      .collect::<Vec<_>>()
+                      .join(" > ")
+              }
+
+              fn top(&self, limit: usize) -> String {"""),
+          ], 'fn slice_begin')
+
+          s = open('src/dhlog.rs').read()
+          if 'fn slice_begin' not in s:
+              s += """
+          static SLICE_N: AtomicU64 = AtomicU64::new(0);
+
+          /// Marks the start of one cooperative thread slice (see `slice_end`).
+          pub struct SliceMark {
+              methods_from: usize,
+              natives_from: usize,
+              report: u64,
+              prev_trace: bool,
+          }
+
+          pub fn slice_begin() -> SliceMark {
+              let n = SLICE_N.fetch_add(1, Ordering::Relaxed) + 1;
+              let report = n <= 6 || n % 600 == 0;
+              let prev_trace = TRACE_ON.load(Ordering::Relaxed);
+              if report {
+                  TRACE_ON.store(true, Ordering::Relaxed);
+              }
+              let natives_from = NATIVES.try_lock().map(|t| t.pos).unwrap_or(0);
+              SliceMark {
+                  methods_from: RING_POS.load(Ordering::Relaxed),
+                  natives_from,
+                  report: if report { n } else { 0 },
+                  prev_trace,
+              }
+          }
+
+          fn slice_methods(from: usize, limit: usize) -> String {
+              let pos = RING_POS.load(Ordering::Relaxed);
+              let Ok(names) = METHODS.try_lock() else {
+                  return String::new();
+              };
+              let start = from
+                  .max(pos.saturating_sub(RING_N))
+                  .max(pos.saturating_sub(limit));
+              let mut runs: Vec<(String, u32)> = Vec::new();
+              for k in start..pos {
+                  let name = short_name(&method_name(RING[k % RING_N].load(Ordering::Relaxed), &names));
+                  let same = matches!(runs.last(), Some((last, _)) if *last == name);
+                  if same {
+                      if let Some(entry) = runs.last_mut() {
+                          entry.1 += 1;
+                      }
+                  } else {
+                      runs.push((name, 1));
+                  }
+              }
+              runs.iter()
+                  .map(|(name, count)| {
+                      if *count > 1 {
+                          format!("{name} x{count}")
+                      } else {
+                          name.clone()
+                      }
+                  })
+                  .collect::<Vec<_>>()
+                  .join(" > ")
+          }
+
+          pub fn slice_end(mark: SliceMark, outcome: &str) {
+              TRACE_ON.store(mark.prev_trace, Ordering::Relaxed);
+              if mark.report == 0 {
+                  return;
+              }
+              let methods = slice_methods(mark.methods_from, 150);
+              let natives = NATIVES
+                  .try_lock()
+                  .map(|t| t.since(mark.natives_from, 150))
+                  .unwrap_or_default();
+              write_line(
+                  &format!(
+                      "SLICE #{}: {}\\n  methods: {}\\n  natives: {}",
+                      mark.report, outcome, methods, natives
+                  ),
+                  true,
+              );
+          }
+          """
+              open('src/dhlog.rs', 'w').write(s)
+              print('src/dhlog.rs slice tracing appended')
+
+          patch('src/vm.rs', [
+           ('    in_thread_slice: bool,\n',
+            '    in_thread_slice: bool,\n    thread_slices: u64,\n    thread_errors: u32,\n'),
+           ('            in_thread_slice: false,\n',
+            '            in_thread_slice: false,\n            thread_slices: 0,\n            thread_errors: 0,\n'),
+           ('            self.current_thread = Some(thread);\n            let outcome = if self.has_instance_method(thread, "run") {\n',
+            """            self.current_thread = Some(thread);
+                      let mark = crate::dhlog::slice_begin();
+                      let base_steps = self.config.max_steps;
+                      self.thread_slices += 1;
+                      self.config.max_steps =
+                          base_steps.saturating_mul(if self.thread_slices <= 20 { 10 } else { 2 });
+                      let outcome = if self.has_instance_method(thread, "run") {
+          """),
+           ("""            self.in_thread_slice = false;
+                      self.current_thread = None;
+                      match outcome {
+                          Some(Ok(_)) if self.frame_steps > self.config.max_steps => alive.push(thread),
+                          Some(Err(error)) => {
+                              crate::dhlog::vm_error("thread run", &error.to_string());
+                          }
+                          _ => {}
+                      }
+          """,
+            """            let used = self.frame_steps;
+                      let budget = self.config.max_steps;
+                      self.config.max_steps = base_steps;
+                      self.in_thread_slice = false;
+                      self.current_thread = None;
+                      match outcome {
+                          Some(Ok(_)) if used > budget => {
+                              crate::dhlog::slice_end(
+                                  mark,
+                                  &format!("yielded or hit the step cap ({budget} steps); the last native shows which"),
+                              );
+                              alive.push(thread);
+                          }
+                          Some(Ok(_)) => {
+                              crate::dhlog::slice_end(
+                                  mark,
+                                  &format!("run() RETURNED after {used} steps (thread finished)"),
+                              );
+                          }
+                          Some(Err(error)) => {
+                              crate::dhlog::slice_end(
+                                  mark,
+                                  &format!("run() FAILED after {used} steps: {error}"),
+                              );
+                              crate::dhlog::vm_error("thread run", &error.to_string());
+                              self.thread_errors += 1;
+                              if self.thread_errors < 300 {
+                                  alive.push(thread);
+                              }
+                          }
+                          None => crate::dhlog::slice_end(mark, "thread has no run() method"),
+                      }
+          """),
+           ('        for (holder, callback) in self.surface_callbacks.clone() {\n            if self.has_instance_method(callback, "surfaceCreated") {\n',
+            """        if let Some(view) = self.framework.content_views.get(&activity).copied() {
+                      let view_calls: Vec<(&str, Vec<Value>)> = vec![
+                          ("onAttachedToWindow", Vec::new()),
+                          ("onWindowVisibilityChanged", vec![Value::Int(0)]),
+                          (
+                              "onSizeChanged",
+                              vec![Value::Int(width), Value::Int(height), Value::Int(0), Value::Int(0)],
+                          ),
+                      ];
+                      for (name, call_args) in view_calls {
+                          if self.has_instance_method(view, name) {
+                              if let Err(error) = self.run_instance_method(view, name, call_args) {
+                                  crate::dhlog::vm_error(name, &error.to_string());
+                              }
+                          }
+                      }
+                  }
+                  for (holder, callback) in self.surface_callbacks.clone() {
+                      if self.has_instance_method(callback, "surfaceCreated") {
+          """),
+           ('        if self.has_instance_method(activity, "onWindowFocusChanged") {\n',
+            """        if let Some(view) = self.framework.content_views.get(&activity).copied() {
+                      if self.has_instance_method(view, "onWindowFocusChanged") {
+                          if let Err(error) =
+                              self.run_instance_method(view, "onWindowFocusChanged", vec![Value::Int(1)])
+                          {
+                              crate::dhlog::vm_error("view onWindowFocusChanged", &error.to_string());
+                          }
+                      }
+                  }
+                  if self.has_instance_method(activity, "onWindowFocusChanged") {
+          """),
+          ], 'thread_errors')
+
+          patch('src/runtime.rs', [
+           ('if commands == 0 && (n <= 3 || n % 300 == 0) {', 'if commands <= 1 && (n <= 3 || n % 300 == 0) {'),
+           ('{method} issued 0 GL commands (the app drew nothing: see earlier errors, or it is a Canvas-only game)',
+            '{method} issued only {commands} GL command(s) = just the frame clear, the app drew nothing (see SLICE lines: what does the draw thread do?)'),
+          ], 'issued only')
+          __DH_PY29__
+          python3 /tmp/slice_fix.py
+
+      - name: Clock fix (ROOT CAUSE of black screen - currentTimeMillis was 0, draw loop slept forever)
+        run: |
+          set -e
+          cat > /tmp/clock_fix.py <<'__DH_PY30__'
+          # ROOT CAUSE of the black screen (found by reading Armored_Strike classes.dex):
+          # the game's draw loop (RSLSurfaceView$a.run) is paced by System.currentTimeMillis() (com.requiem.a.aa timer):
+          # "if (elapsed < gameTimerRate) SystemClock.sleep(rest)" and only otherwise lockCanvas()/draw.
+          # The HLE returned 0 from currentTimeMillis() forever (elapsed always 0) and turned sleep() into a slice yield,
+          # and every slice restarts run() (timer reset) -> the loop slept forever and never drew a frame.
+          # Fix: real wall clock + virtual clock; sleep() inside a draw-thread slice advances the virtual clock and returns.
+          import sys
+          def patch(p, edits, marker):
+              s = open(p).read()
+              if marker in s:
+                  print(p, 'already patched'); return
+              for a, b in edits:
+                  if s.count(a) != 1:
+                      sys.exit('anchor missing or ambiguous (%d) in %s: %r' % (s.count(a), p, a[:90]))
+                  s = s.replace(a, b, 1)
+              open(p, 'w').write(s)
+              print(p, 'patched')
+
+          patch('src/vm.rs', [
+           ('static NANO_TIME_START: OnceLock<std::time::Instant> = OnceLock::new();\n',
+            """static NANO_TIME_START: OnceLock<std::time::Instant> = OnceLock::new();
+          static VIRTUAL_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+          static SLEEP_RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+          /// Milliseconds since the VM clock started: real time plus time "slept" by cooperative threads.
+          fn clock_ms() -> i64 {
+              let start = NANO_TIME_START.get_or_init(std::time::Instant::now);
+              start.elapsed().as_millis() as i64 + VIRTUAL_MS.load(std::sync::atomic::Ordering::Relaxed)
+          }
+          """),
+           ('            return Ok(Value::Long(clock.elapsed().as_nanos() as i64));\n',
+            '            return Ok(Value::Long(\n                clock.elapsed().as_nanos() as i64\n                    + VIRTUAL_MS.load(std::sync::atomic::Ordering::Relaxed) * 1_000_000,\n            ));\n'),
+           ('                "currentTimeMillis" => return Ok(Value::Long(0)),\n',
+            '                "currentTimeMillis" => return Ok(Value::Long(1_700_000_000_000 + clock_ms())),\n'),
+           ('        if class_name == "Landroid/os/Looper;" {\n',
+            """        if class_name == "Landroid/os/SystemClock;"
+                      && matches!(
+                          method_name,
+                          "uptimeMillis" | "elapsedRealtime" | "currentThreadTimeMillis"
+                      )
+                  {
+                      return Ok(Value::Long(clock_ms()));
+                  }
+                  if class_name == "Landroid/os/Looper;" {
+          """),
+           ('        if self.in_thread_slice\n            && matches!(\n                (class_name, method_name),\n                ("Ljava/lang/Object;", "wait")\n',
+            """        if self.in_thread_slice
+                      && matches!(
+                          (class_name, method_name),
+                          ("Landroid/os/SystemClock;", "sleep") | ("Ljava/lang/Thread;", "sleep")
+                      )
+                  {
+                      // a draw thread paces itself with sleep(): advance the virtual clock instead of ending the slice
+                      let ms = args
+                          .iter()
+                          .find_map(|value| match value {
+                              Value::Long(n) => Some(*n),
+                              Value::Int(n) => Some(*n as i64),
+                              _ => None,
+                          })
+                          .unwrap_or(1);
+                      if SLEEP_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+                          VIRTUAL_MS.fetch_add(ms.clamp(0, 1000), std::sync::atomic::Ordering::Relaxed);
+                          return Ok(Value::Void);
+                      }
+                  }
+                  if self.in_thread_slice
+                      && matches!(
+                          (class_name, method_name),
+                          ("Ljava/lang/Object;", "wait")
+          """),
+           ('            let mark = crate::dhlog::slice_begin();\n',
+            '            let mark = crate::dhlog::slice_begin();\n            SLEEP_RUN.store(0, std::sync::atomic::Ordering::Relaxed);\n'),
+          ], 'fn clock_ms')
+          __DH_PY30__
+          python3 /tmp/clock_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
