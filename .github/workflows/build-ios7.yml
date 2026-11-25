@@ -5,6 +5,8 @@ name: Build DonutHLE iOS 7 (armv7)
 #   - GPU op-stream recording in gles.rs + runtime.rs/lib.rs FFI (donuthle_gpu_*), VM natives for alpha/cull/fog/tex-env
 #   - generic boot: falls back to the app's own View (onDraw/onDrawFrame/render) instead of failing with "no ApplicationListener or TinySantaView"
 #   - Dalvik fixes: instance-of width, goto/32, packed/sparse-switch (fixes "register v56 is outside the frame")
+#   - Better logs in donuthle.log: VM ERROR reports (phase, Dalvik stack at failure, recent calls), repeat collapsing, swallowed errors reported
+#   - GLSurfaceView.Renderer games (Armored Strike): setRenderer capture, javax GL10/GL11 -> GLES backend, onSurfaceCreated/Changed, black-frame log
 #   - slice::as_chunks compat (the crate needs Rust 1.88 otherwise), zip without C-dependent features
 # Then: Rust staticlib for armv7-apple-ios7 (-Zbuild-std) + Theos app, cross-compiled on Linux. Outputs .ipa and .deb.
 # Toolchain/SDK steps follow ioskvm's ios.yml (Theos + L1ghtmann vanilla clang + iPhoneOS 9.3 SDK).
@@ -5075,6 +5077,290 @@ jobs:
           print('notify fix patched')
           __DH_PY26__
           python3 /tmp/notify_fix.py
+
+      - name: Drive GLSurfaceView.Renderer games (setRenderer, javax GL10/GL11 routing, onSurfaceCreated/Changed, black-frame log)
+        run: |
+          set -e
+          cat > /tmp/gl_fix.py <<'__DH_PY27__'
+          # GLSurfaceView.Renderer games (e.g. Armored Strike's RSLGLSurfaceView/RSLGLRenderer) rendered a black screen:
+          #  - GLSurfaceView.setRenderer was swallowed, so onSurfaceCreated/onSurfaceChanged never ran (textures/viewport never set up)
+          #  - javax.microedition.khronos.opengles.GL10/GL11 calls had no handler -> "framework method ... is not implemented" aborted every frame
+          # Fix: remember the renderer, run its surface callbacks after the activity lifecycle, route GL10/GL11 into the existing GLES
+          # backend (unknown gl* calls are logged once and ignored), prefer the renderer as the frame target, and log 0-command frames.
+          import sys
+          def patch(p, edits, marker):
+              s = open(p).read()
+              if marker in s:
+                  print(p, 'already patched'); return
+              for a, b in edits:
+                  if s.count(a) != 1:
+                      sys.exit('anchor missing or ambiguous (%d) in %s: %r' % (s.count(a), p, a[:80]))
+                  s = s.replace(a, b, 1)
+              open(p, 'w').write(s)
+              print(p, 'patched')
+
+          patch('src/framework.rs', [
+           ('    pub gdx_listener: Option<u32>,\n',
+            '    pub gdx_listener: Option<u32>,\n'
+            '    /// `GLSurfaceView.Renderer` registered through `setRenderer` (plain Android GLES apps).\n'
+            '    pub gl_renderer: Option<u32>,\n'),
+          ], 'gl_renderer')
+
+          patch('src/vm.rs', [
+           ('        crate::dhlog::native_call(class_name, method_name);\n'
+            '        if class_name.starts_with("Landroid/")\n'
+            '            && matches!(\n',
+            '        crate::dhlog::native_call(class_name, method_name);\n'
+            '        // GLSurfaceView.Renderer apps: remember the renderer so boot() can run onSurfaceCreated/onSurfaceChanged on it.\n'
+            '        if method_name == "setRenderer" && class_name.ends_with("GLSurfaceView;") {\n'
+            '            if let Some(Value::Object(renderer)) = args.get(1) {\n'
+            '                self.framework.gl_renderer = Some(*renderer);\n'
+            '                crate::dhlog::log("GLSurfaceView.setRenderer captured");\n'
+            '            }\n'
+            '            return Ok(Value::Void);\n'
+            '        }\n'
+            '        // javax.microedition.khronos GL10/GL11 -> same GLES backend as the libGDX GL10 shim. An unimplemented gl* call\n'
+            '        // is logged once and ignored instead of aborting the whole frame (that was the black screen).\n'
+            '        if class_name.starts_with("Ljavax/microedition/khronos/opengles/GL") {\n'
+            '            return match self.dispatch_gdx("Lcom/badlogic/gdx/graphics/GL10;", method_name, args) {\n'
+            '                Ok(value) => Ok(value),\n'
+            '                Err(_) if method_name.starts_with("gl") => {\n'
+            '                    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());\n'
+            '                    if let Ok(mut seen) = SEEN.lock() {\n'
+            '                        if !seen.iter().any(|name| name == method_name) {\n'
+            '                            seen.push(method_name.to_owned());\n'
+            '                            crate::dhlog::log(&format!(\n'
+            '                                "GL call not implemented, ignored: {class_name}->{method_name}"\n'
+            '                            ));\n'
+            '                        }\n'
+            '                    }\n'
+            '                    Ok(Value::Void)\n'
+            '                }\n'
+            '                Err(error) => Err(error),\n'
+            '            };\n'
+            '        }\n'
+            '        if class_name.starts_with("Landroid/")\n'
+            '            && matches!(\n'),
+          ], 'gl_renderer')
+
+          patch('src/runtime.rs', [
+           ('                    vm.run_activity_lifecycle(activity_object, width, height);\n',
+            '                    vm.run_activity_lifecycle(activity_object, width, height);\n'
+            '                    if let Some(renderer) = vm.framework.gl_renderer {\n'
+            '                        crate::dhlog::phase("boot: GLSurfaceView.Renderer onSurfaceCreated/onSurfaceChanged");\n'
+            '                        let gl = vm.alloc_instance("Ljavax/microedition/khronos/opengles/GL10;");\n'
+            '                        let config = vm.alloc_instance("Ljavax/microedition/khronos/egl/EGLConfig;");\n'
+            '                        if let Err(error) = vm.run_instance_method(\n'
+            '                            renderer,\n'
+            '                            "onSurfaceCreated",\n'
+            '                            vec![VmValue::Object(gl), VmValue::Object(config)],\n'
+            '                        ) {\n'
+            '                            crate::dhlog::app_log("e", &format!("onSurfaceCreated failed: {error}"));\n'
+            '                        }\n'
+            '                        if let Err(error) = vm.run_instance_method(\n'
+            '                            renderer,\n'
+            '                            "onSurfaceChanged",\n'
+            '                            vec![VmValue::Object(gl), VmValue::Int(width), VmValue::Int(height)],\n'
+            '                        ) {\n'
+            '                            crate::dhlog::app_log("e", &format!("onSurfaceChanged failed: {error}"));\n'
+            '                        }\n'
+            '                    }\n'),
+           ('                    .or_else(|| {\n'
+            '                        vm.framework\n'
+            '                            .content_views\n',
+            '                    .or_else(|| vm.framework.gl_renderer)\n'
+            '                    .or_else(|| {\n'
+            '                        vm.framework\n'
+            '                            .content_views\n'),
+           ('        if self.vm.framework.gles.gpu_enabled() {\n'
+            '            self.vm.framework.gles.finish_gpu_frame();\n',
+            '        {\n'
+            '            use std::sync::atomic::{AtomicU64, Ordering};\n'
+            '            static FRAMES: AtomicU64 = AtomicU64::new(0);\n'
+            '            let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;\n'
+            '            let commands = self.vm.framework.gles.command_count();\n'
+            '            if commands == 0 && (n <= 3 || n % 300 == 0) {\n'
+            '                crate::dhlog::log(&format!(\n'
+            '                    "BLACK FRAME {n}: {method} issued 0 GL commands (the app drew nothing: see earlier errors, or it is a Canvas-only game)"\n'
+            '                ));\n'
+            '            } else if n == 1 || n % 300 == 0 {\n'
+            '                crate::dhlog::log(&format!("frame {n}: {method} issued {commands} GL commands"));\n'
+            '            }\n'
+            '        }\n'
+            '        if self.vm.framework.gles.gpu_enabled() {\n'
+            '            self.vm.framework.gles.finish_gpu_frame();\n'),
+          ], 'gl_renderer')
+          __DH_PY27__
+          python3 /tmp/gl_fix.py
+
+      - name: Better error logs (VM error reports with Dalvik stack, swallowed errors, repeat collapsing, app Log limit)
+        run: |
+          set -e
+          cat > /tmp/log_fix.py <<'__DH_PY28__'
+          # Better error logs (all into Documents/donuthle.log through dhlog):
+          #  - every VM failure is logged as a report: message, boot phase, Dalvik call stack at the point of failure (outer > inner),
+          #    recent calls, steps; repeated identical errors are collapsed (logged at x1, x10, x100 ...)
+          #  - errors that were only swallowed before (lifecycle, threads, runnables, onSurface*) now get the same report
+          #  - errors returned to the UI (boot / frame) carry the report, frame/touch failures no longer vanish into eprintln (invisible on iOS)
+          #  - app android.util.Log: warnings/errors are still logged after the 400-line limit, and the limit is announced
+          import re, sys
+          def rw(p, fn):
+              s = open(p).read(); t = fn(s)
+              if t == s: sys.exit('no change in ' + p)
+              open(p, 'w').write(t); print(p, 'patched')
+          def once(s, a, b, p):
+              if s.count(a) != 1: sys.exit('anchor missing or ambiguous (%d) in %s: %r' % (s.count(a), p, a[:80]))
+              return s.replace(a, b, 1)
+
+          if 'pub fn vm_error' in open('src/dhlog.rs').read():
+              print('already patched'); sys.exit(0)
+
+          def swallowed(s):
+              def repl(m):
+                  ctx = m.group(1)
+                  ctx = 'ctx = format!("%s")' % ctx if '{' in ctx else None
+                  arg = '&format!("%s")' % m.group(1) if '{' in m.group(1) else '"%s"' % m.group(1)
+                  return 'crate::dhlog::vm_error(%s, &error.to_string());' % arg
+              return re.subn(r'crate::dhlog::app_log\("e", &format!\("([^"]*?) failed: \{error\}"\)\);', repl, s)
+
+          def dhlog(s):
+              s = once(s, 'pub fn short_status() -> String {\n', '''static ERR_DEPTH: AtomicUsize = AtomicUsize::new(usize::MAX);
+          static LAST_ERR: Mutex<(String, u64)> = Mutex::new((String::new(), 0));
+
+          /// Called by the VM whenever a call returns an error; the innermost (first) failure keeps its depth.
+          pub fn note_error(depth: usize) {
+              let _ = ERR_DEPTH.compare_exchange(usize::MAX, depth, Ordering::Relaxed, Ordering::Relaxed);
+          }
+
+          fn stack_at(depth: usize, last_frames: usize) -> String {
+              let depth = depth.min(STACK_N - 1);
+              let Ok(names) = METHODS.try_lock() else {
+                  return String::new();
+              };
+              let from = (depth + 1).saturating_sub(last_frames);
+              let mut out = Vec::new();
+              for d in from..=depth {
+                  let idx = STACK[d].load(Ordering::Relaxed);
+                  out.push(short_name(&method_name(idx, &names)));
+              }
+              out.join(" > ")
+          }
+
+          /// Forget a failure that was handled inside the VM (called at the start of every frame).
+          pub fn clear_error() {
+              ERR_DEPTH.store(usize::MAX, Ordering::Relaxed);
+          }
+
+          /// Logs a VM failure with phase, Dalvik stack at the failure point and recent calls. Returns the report text.
+          /// Identical consecutive errors are only written at x1, x10, x100, ...
+          pub fn vm_error(context: &str, error: &str) -> String {
+              let depth = ERR_DEPTH.swap(usize::MAX, Ordering::Relaxed);
+              let stack = if depth == usize::MAX {
+                  stack_string(12)
+              } else {
+                  stack_at(depth, 12)
+              };
+              let mut report = format!(
+                  "VM ERROR in {context}: {error}\\n  phase: {}\\n  stack (outer > inner): {stack}\\n  recent calls: {}\\n  steps: {} calls: {}",
+                  phase_name(),
+                  recent_methods(8),
+                  STEPS.load(Ordering::Relaxed),
+                  CALLS.load(Ordering::Relaxed)
+              );
+              if error.contains("not implemented") {
+                  report.push_str("\\n  hint: unimplemented API, the Class->method in the message must be added to the VM");
+              }
+              let repeat = match LAST_ERR.lock() {
+                  Ok(mut last) => {
+                      if last.0 == error {
+                          last.1 += 1;
+                      } else {
+                          *last = (error.to_owned(), 1);
+                      }
+                      last.1
+                  }
+                  Err(_) => 1,
+              };
+              let mut p = 1u64;
+              while p < repeat {
+                  p = p.saturating_mul(10);
+              }
+              if repeat == p {
+                  if repeat > 1 {
+                      write_line(&format!("{report}\\n  (same error, x{repeat})"), true);
+                  } else {
+                      write_line(&report, true);
+                  }
+              }
+              report
+          }
+
+          pub fn short_status() -> String {
+          ''', 'src/dhlog.rs')
+              s = once(s, '    if n < APP_LOG_LIMIT {\n        let cut: String',
+                       '''    let important = matches!(kind, "e" | "w" | "wtf");
+              if n == APP_LOG_LIMIT {
+                  write_line("app Log limit reached: further non-error app logs are suppressed", true);
+              }
+              if n < APP_LOG_LIMIT || (important && n < APP_LOG_LIMIT * 5) {
+                  let cut: String''', 'src/dhlog.rs')
+              return s
+          rw('src/dhlog.rs', dhlog)
+
+          def vm(s):
+              s = once(s, '    fn call_method(&mut self, method_index: usize, args: Vec<Value>) -> Result<Value, VmError> {\n'
+                          '        crate::dhlog::enter(method_index, self.call_depth);\n',
+                       '''    fn call_method(&mut self, method_index: usize, args: Vec<Value>) -> Result<Value, VmError> {
+                  let result = self.call_method_inner(method_index, args);
+                  if result.is_err() {
+                      crate::dhlog::note_error(self.call_depth);
+                  }
+                  result
+              }
+
+              fn call_method_inner(
+                  &mut self,
+                  method_index: usize,
+                  args: Vec<Value>,
+              ) -> Result<Value, VmError> {
+                  crate::dhlog::enter(method_index, self.call_depth);
+          ''', 'src/vm.rs')
+              s = once(s, '        let result = self.call_method(method_index, args);\n        self.run_thread_slices();\n',
+                       '        crate::dhlog::clear_error();\n        let result = self.call_method(method_index, args);\n        self.run_thread_slices();\n', 'src/vm.rs')
+              # swallowed errors -> full report
+              s, n = swallowed(s)
+              print('vm.rs swallowed-error sites:', n)
+              if n == 0: sys.exit('no swallowed-error sites matched')
+              return s
+          rw('src/vm.rs', vm)
+
+          def runtime(s):
+              s, n = swallowed(s)
+              s, m = re.subn(r'\.map_err\(\|error\| anyhow::anyhow!\(error\.to_string\(\)\)\)\?',
+                             '.map_err(|error| anyhow::anyhow!(crate::dhlog::vm_error("launch/frame", &error.to_string())))?', s)
+              print('runtime.rs sites:', n, m)
+              if m == 0: sys.exit('no map_err sites matched')
+              return s
+          rw('src/runtime.rs', runtime)
+
+          def lib(s):
+              s = once(s, '            eprintln!("DonutHLE frame render failed: {error}");\n',
+                       '''            let _ = &error;
+                      {
+                          use std::sync::atomic::{AtomicU64, Ordering};
+                          static FAILS: AtomicU64 = AtomicU64::new(0);
+                          let n = FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                          if n == 1 || n % 300 == 0 {
+                              crate::dhlog::log(&format!("frame render failed (#{n}): see the VM ERROR report above"));
+                          }
+                      }
+          ''', 'src/lib.rs')
+              s = once(s, '            eprintln!("DonutHLE touch dispatch failed: {error}");\n',
+                       '            crate::dhlog::vm_error("touch", &error.to_string());\n', 'src/lib.rs')
+              return s
+          rw('src/lib.rs', lib)
+          __DH_PY28__
+          python3 /tmp/log_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
