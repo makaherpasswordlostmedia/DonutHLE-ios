@@ -5,9 +5,9 @@ name: Build DonutHLE iOS 7 (armv7)
 #   - GPU op-stream recording in gles.rs + runtime.rs/lib.rs FFI (donuthle_gpu_*), VM natives for alpha/cull/fog/tex-env
 #   - generic boot: falls back to the app's own View (onDraw/onDrawFrame/render) instead of failing with "no ApplicationListener or TinySantaView"
 #   - Dalvik fixes: instance-of width, goto/32, packed/sparse-switch (fixes "register v56 is outside the frame")
+#   - Software Canvas/Bitmap (src/vm/canvas.rs): Armored Strike draws through SurfaceHolder.lockCanvas, the old stub drew nothing
 #   - Better logs in donuthle.log: VM ERROR reports (phase, Dalvik stack at failure, recent calls), repeat collapsing, swallowed errors reported
 #   - GLSurfaceView.Renderer games (Armored Strike): setRenderer capture, javax GL10/GL11 -> GLES backend, onSurfaceCreated/Changed, black-frame log
-#   - Draw-thread diagnostics: donuthle.log gets "SLICE #n" lines (methods + natives each draw-thread slice ran), bigger slice budget, thread survives errors, view lifecycle (onAttachedToWindow/onSizeChanged/focus), accurate BLACK FRAME detection
 #   - slice::as_chunks compat (the crate needs Rust 1.88 otherwise), zip without C-dependent features
 # Then: Rust staticlib for armv7-apple-ios7 (-Zbuild-std) + Theos app, cross-compiled on Linux. Outputs .ipa and .deb.
 # Toolchain/SDK steps follow ioskvm's ios.yml (Theos + L1ghtmann vanilla clang + iPhoneOS 9.3 SDK).
@@ -5363,338 +5363,877 @@ jobs:
           __DH_PY28__
           python3 /tmp/log_fix.py
 
-      - name: Draw-thread diagnostics (SLICE trace in donuthle.log), draw-thread resilience, view lifecycle, black-frame detector
+      - name: Software Canvas/Bitmap for lockCanvas games (drawColor, drawRect, drawBitmap src/dst, createBitmap crop/Matrix, Canvas(Bitmap))
         run: |
           set -e
-          cat > /tmp/slice_fix.py <<'__DH_PY29__'
-          # Draw-thread diagnostics + resilience (Armored Strike: black screen, draw thread loops without issuing GL/Canvas calls).
-          #  - dhlog: ring buffers 16 -> 512 entries; per-slice trace (first 6 slices, then every 600th) written to donuthle.log as
-          #    "SLICE #n: <outcome>" + the DEX methods and framework natives that slice executed (repeats collapsed)
-          #  - thread slices: bigger step budget (10x for the first 20 slices, 2x afterwards) so one-time init work on the draw thread
-          #    is not cut in half by the per-frame cap; a failing run() no longer kills the thread for good (up to 300 errors)
-          #  - view lifecycle: onAttachedToWindow / onWindowVisibilityChanged / onSizeChanged / onWindowFocusChanged on the content
-          #    view before the SurfaceHolder callbacks (games gate their draw loop on these)
-          #  - black-frame detector: begin_frame() already counts 1 command, so 0 never happened; "<= 1" means nothing was drawn
-          import sys
+          mkdir -p src/vm
+          cat > src/vm/canvas.rs <<'__DH_RS__'
+          //! Software bitmaps + android.graphics.Canvas for apps that draw through
+          //! SurfaceHolder.lockCanvas() (e.g. Armored Strike's RSLSurfaceView thread).
+          //!
+          //! * Every Bitmap gets a CPU pixel buffer on first use (decoded from its asset, or transparent).
+          //! * Canvas(Bitmap) draws into that buffer; the screen canvas draws textured quads through the GLES backend.
+          //! * Bitmap.createBitmap (crop / Matrix scale+rotate), createScaledBitmap, get/setPixel(s), eraseColor.
+          //! * Canvas.drawColor / drawRect / drawBitmap(x,y) / drawBitmap(src,dst) with Paint alpha.
+          //! Text, lines, paths and ovals are logged once and ignored for now.
+          use super::*;
+          use std::sync::Mutex;
 
-          def patch(p, edits, marker):
-              s = open(p).read()
-              if marker in s:
-                  print(p, 'already patched'); return
-              for a, b in edits:
-                  if s.count(a) != 1:
-                      sys.exit('anchor missing or ambiguous (%d) in %s: %r' % (s.count(a), p, a[:90]))
-                  s = s.replace(a, b, 1)
-              open(p, 'w').write(s)
-              print(p, 'patched')
+          const CLEAR_COLOR_BUFFER: u32 = 0x4000;
+          const MAX_DIM: i64 = 4096;
+          const TRANSPARENT: Rgba8 = Rgba8 {
+              r: 0,
+              g: 0,
+              b: 0,
+              a: 0,
+          };
 
-          patch('src/dhlog.rs', [
-           ('const RING_N: usize = 16;', 'const RING_N: usize = 512;'),
-           ('    fn top(&self, limit: usize) -> String {',
-            """    /// Names recorded since ring position `from` (at most `limit`, oldest first, repeats collapsed).
-              fn since(&self, from: usize, limit: usize) -> String {
-                  let Some(counts) = self.counts.as_ref() else {
-                      return String::new();
-                  };
-                  let start = from
-                      .max(self.pos.saturating_sub(RING_N))
-                      .max(self.pos.saturating_sub(limit));
-                  let mut runs: Vec<(String, u32)> = Vec::new();
-                  for k in start..self.pos {
-                      let Some(key) = self.ring.get(k % RING_N) else {
-                          continue;
-                      };
-                      let Some((name, _)) = counts.get(key) else {
-                          continue;
-                      };
-                      let name = short_name(name);
-                      let same = matches!(runs.last(), Some((last, _)) if *last == name);
-                      if same {
-                          if let Some(entry) = runs.last_mut() {
-                              entry.1 += 1;
-                          }
-                      } else {
-                          runs.push((name, 1));
-                      }
-                  }
-                  runs.iter()
-                      .map(|(name, count)| {
-                          if *count > 1 {
-                              format!("{name} x{count}")
-                          } else {
-                              name.clone()
-                          }
-                      })
-                      .collect::<Vec<_>>()
-                      .join(" > ")
-              }
-
-              fn top(&self, limit: usize) -> String {"""),
-          ], 'fn slice_begin')
-
-          s = open('src/dhlog.rs').read()
-          if 'fn slice_begin' not in s:
-              s += """
-          static SLICE_N: AtomicU64 = AtomicU64::new(0);
-
-          /// Marks the start of one cooperative thread slice (see `slice_end`).
-          pub struct SliceMark {
-              methods_from: usize,
-              natives_from: usize,
-              report: u64,
-              prev_trace: bool,
+          #[derive(Debug, Clone)]
+          pub(super) struct CpuBitmap {
+              pub(super) w: u32,
+              pub(super) h: u32,
+              pub(super) px: Vec<Rgba8>,
+              /// GL texture id, 0 = not uploaded yet.
+              pub(super) tex: u32,
+              pub(super) dirty: bool,
           }
 
-          pub fn slice_begin() -> SliceMark {
-              let n = SLICE_N.fetch_add(1, Ordering::Relaxed) + 1;
-              let report = n <= 6 || n % 600 == 0;
-              let prev_trace = TRACE_ON.load(Ordering::Relaxed);
-              if report {
-                  TRACE_ON.store(true, Ordering::Relaxed);
-              }
-              let natives_from = NATIVES.try_lock().map(|t| t.pos).unwrap_or(0);
-              SliceMark {
-                  methods_from: RING_POS.load(Ordering::Relaxed),
-                  natives_from,
-                  report: if report { n } else { 0 },
-                  prev_trace,
-              }
+          fn pack_argb(c: Rgba8) -> i32 {
+              (((c.a as u32) << 24) | ((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32) as i32
           }
 
-          fn slice_methods(from: usize, limit: usize) -> String {
-              let pos = RING_POS.load(Ordering::Relaxed);
-              let Ok(names) = METHODS.try_lock() else {
-                  return String::new();
+          fn blend_over(dst: Rgba8, src: Rgba8) -> Rgba8 {
+              let sa = src.a as u32;
+              if sa == 255 {
+                  return src;
+              }
+              if sa == 0 {
+                  return dst;
+              }
+              let da = dst.a as u32;
+              let out_a = sa + da * (255 - sa) / 255;
+              if out_a == 0 {
+                  return TRANSPARENT;
+              }
+              let mix = |s: u8, d: u8| -> u8 {
+                  ((s as u32 * sa + d as u32 * da * (255 - sa) / 255) / out_a).min(255) as u8
               };
-              let start = from
-                  .max(pos.saturating_sub(RING_N))
-                  .max(pos.saturating_sub(limit));
-              let mut runs: Vec<(String, u32)> = Vec::new();
-              for k in start..pos {
-                  let name = short_name(&method_name(RING[k % RING_N].load(Ordering::Relaxed), &names));
-                  let same = matches!(runs.last(), Some((last, _)) if *last == name);
-                  if same {
-                      if let Some(entry) = runs.last_mut() {
-                          entry.1 += 1;
+              Rgba8 {
+                  r: mix(src.r, dst.r),
+                  g: mix(src.g, dst.g),
+                  b: mix(src.b, dst.b),
+                  a: out_a.min(255) as u8,
+              }
+          }
+
+          fn tint_pixel(p: Rgba8, t: Rgba8) -> Rgba8 {
+              Rgba8 {
+                  r: ((p.r as u32 * t.r as u32) / 255) as u8,
+                  g: ((p.g as u32 * t.g as u32) / 255) as u8,
+                  b: ((p.b as u32 * t.b as u32) / 255) as u8,
+                  a: ((p.a as u32 * t.a as u32) / 255) as u8,
+              }
+          }
+
+          fn clamp_dim(v: i64) -> u32 {
+              v.clamp(1, MAX_DIM) as u32
+          }
+
+          /// Copy of the rectangle (x, y, w, h); parts outside the source stay transparent.
+          fn crop(px: &[Rgba8], sw: u32, sh: u32, x: i32, y: i32, w: i32, h: i32) -> (u32, u32, Vec<Rgba8>) {
+              let nw = clamp_dim(w as i64);
+              let nh = clamp_dim(h as i64);
+              let mut out = vec![TRANSPARENT; (nw * nh) as usize];
+              for yy in 0..nh {
+                  for xx in 0..nw {
+                      let sx = x as i64 + xx as i64;
+                      let sy = y as i64 + yy as i64;
+                      if sx >= 0 && sy >= 0 && sx < sw as i64 && sy < sh as i64 {
+                          out[(yy * nw + xx) as usize] = px[(sy as u32 * sw + sx as u32) as usize];
                       }
+                  }
+              }
+              (nw, nh, out)
+          }
+
+          fn resize(px: &[Rgba8], sw: u32, sh: u32, nw: u32, nh: u32) -> Vec<Rgba8> {
+              let mut out = vec![TRANSPARENT; (nw * nh) as usize];
+              for yy in 0..nh {
+                  let sy = ((yy as u64 * sh as u64) / nh as u64).min(sh as u64 - 1) as u32;
+                  for xx in 0..nw {
+                      let sx = ((xx as u64 * sw as u64) / nw as u64).min(sw as u64 - 1) as u32;
+                      out[(yy * nw + xx) as usize] = px[(sy * sw + sx) as usize];
+                  }
+              }
+              out
+          }
+
+          /// Scale (negative = flip) then rotate clockwise by `rot_deg`, nearest neighbour.
+          fn transform(px: &[Rgba8], w: u32, h: u32, sx: f32, sy: f32, rot_deg: f32) -> (u32, u32, Vec<Rgba8>) {
+              let sx = if sx.abs() < 1e-4 { 1.0 } else { sx };
+              let sy = if sy.abs() < 1e-4 { 1.0 } else { sy };
+              let cw = w as f32 * sx.abs();
+              let ch = h as f32 * sy.abs();
+              let r = rot_deg.to_radians();
+              let (s, c) = (r.sin(), r.cos());
+              let nw = clamp_dim((cw * c.abs() + ch * s.abs()).round() as i64);
+              let nh = clamp_dim((cw * s.abs() + ch * c.abs()).round() as i64);
+              let mut out = vec![TRANSPARENT; (nw * nh) as usize];
+              for y in 0..nh {
+                  for x in 0..nw {
+                      let dx = x as f32 + 0.5 - nw as f32 / 2.0;
+                      let dy = y as f32 + 0.5 - nh as f32 / 2.0;
+                      let ux = c * dx + s * dy;
+                      let uy = -s * dx + c * dy;
+                      let fx = ux / sx + w as f32 / 2.0;
+                      let fy = uy / sy + h as f32 / 2.0;
+                      if fx >= 0.0 && fy >= 0.0 && fx < w as f32 && fy < h as f32 {
+                          out[(y * nw + x) as usize] = px[(fy as u32 * w + fx as u32) as usize];
+                      }
+                  }
+              }
+              (nw, nh, out)
+          }
+
+          fn opt_object(args: &[Value], index: usize) -> Option<ObjectId> {
+              match args.get(index) {
+                  Some(Value::Object(id)) => Some(*id),
+                  _ => None,
+              }
+          }
+
+          fn log_once(kind: &str) {
+              static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+              if let Ok(mut seen) = SEEN.lock() {
+                  if !seen.iter().any(|name| name == kind) {
+                      seen.push(kind.to_owned());
+                      crate::dhlog::log(&format!("canvas op not supported yet, ignored: {kind}"));
+                  }
+              }
+          }
+
+          impl<'a> Vm<'a> {
+              fn new_cpu_bitmap(&mut self, w: u32, h: u32, px: Vec<Rgba8>) -> ObjectId {
+                  let id = self.alloc_bitmap(w as i32, h as i32);
+                  self.cpu_bitmaps.insert(
+                      id,
+                      CpuBitmap {
+                          w,
+                          h,
+                          px,
+                          tex: 0,
+                          dirty: true,
+                      },
+                  );
+                  id
+              }
+
+              /// Make sure `bitmap` has pixel data: decode its asset file, else a transparent buffer.
+              fn ensure_cpu_bitmap(&mut self, bitmap: ObjectId) -> bool {
+                  if self.cpu_bitmaps.contains_key(&bitmap) {
+                      return true;
+                  }
+                  let is_bitmap = matches!(
+                      self.heap_object(bitmap),
+                      Some(HeapObject::Instance { class_name, .. }) if class_name.as_str() == "Landroid/graphics/Bitmap;"
+                  );
+                  if !is_bitmap {
+                      return false;
+                  }
+                  let decoded = self
+                      .object_field_string(bitmap, "path")
+                      .and_then(|path| {
+                          self.framework
+                              .assets
+                              .as_ref()
+                              .and_then(|assets| assets.image(&path).ok())
+                      });
+                  let entry = match decoded {
+                      Some(image) => CpuBitmap {
+                          w: image.width.max(1),
+                          h: image.height.max(1),
+                          px: image.pixels,
+                          tex: 0,
+                          dirty: true,
+                      },
+                      None => {
+                          let w = clamp_dim(self.object_field_int(bitmap, "width").unwrap_or(1) as i64);
+                          let h = clamp_dim(self.object_field_int(bitmap, "height").unwrap_or(1) as i64);
+                          CpuBitmap {
+                              w,
+                              h,
+                              px: vec![TRANSPARENT; (w * h) as usize],
+                              tex: 0,
+                              dirty: true,
+                          }
+                      }
+                  };
+                  if entry.px.len() != (entry.w * entry.h) as usize {
+                      return false;
+                  }
+                  self.cpu_bitmaps.insert(bitmap, entry);
+                  true
+              }
+
+              fn bitmap_texture(&mut self, bitmap: ObjectId) -> u32 {
+                  if !self.ensure_cpu_bitmap(bitmap) {
+                      return 0;
+                  }
+                  let Some(entry) = self.cpu_bitmaps.get_mut(&bitmap) else {
+                      return 0;
+                  };
+                  let gles = &mut self.framework.gles;
+                  if entry.tex == 0 {
+                      entry.tex = gles.upload_texture(entry.w, entry.h, &entry.px);
+                      entry.dirty = false;
+                  } else if entry.dirty {
+                      gles.bind_texture(0x0DE1, entry.tex);
+                      gles.tex_image_2d(entry.w, entry.h, &entry.px);
+                      entry.dirty = false;
+                  }
+                  entry.tex
+              }
+
+              fn canvas_xform(&self, canvas: ObjectId, target: Option<ObjectId>) -> [f32; 4] {
+                  if target.is_some() {
+                      [
+                          self.object_field_float(canvas, "tx").unwrap_or(0.0),
+                          self.object_field_float(canvas, "ty").unwrap_or(0.0),
+                          self.object_field_float(canvas, "sx").unwrap_or(1.0),
+                          self.object_field_float(canvas, "sy").unwrap_or(1.0),
+                      ]
                   } else {
-                      runs.push((name, 1));
+                      let s = self.canvas_state;
+                      [s.x, s.y, s.scale_x, s.scale_y]
                   }
               }
-              runs.iter()
-                  .map(|(name, count)| {
-                      if *count > 1 {
-                          format!("{name} x{count}")
-                      } else {
-                          name.clone()
-                      }
-                  })
-                  .collect::<Vec<_>>()
-                  .join(" > ")
-          }
 
-          pub fn slice_end(mark: SliceMark, outcome: &str) {
-              TRACE_ON.store(mark.prev_trace, Ordering::Relaxed);
-              if mark.report == 0 {
-                  return;
+              fn set_canvas_xform(&mut self, canvas: ObjectId, v: [f32; 4]) {
+                  self.set_object_field(canvas, "tx", Value::Float(v[0]));
+                  self.set_object_field(canvas, "ty", Value::Float(v[1]));
+                  self.set_object_field(canvas, "sx", Value::Float(v[2]));
+                  self.set_object_field(canvas, "sy", Value::Float(v[3]));
               }
-              let methods = slice_methods(mark.methods_from, 150);
-              let natives = NATIVES
-                  .try_lock()
-                  .map(|t| t.since(mark.natives_from, 150))
-                  .unwrap_or_default();
-              write_line(
-                  &format!(
-                      "SLICE #{}: {}\\n  methods: {}\\n  natives: {}",
-                      mark.report, outcome, methods, natives
-                  ),
-                  true,
-              );
+
+              fn paint_argb(&self, paint: Option<ObjectId>) -> i32 {
+                  paint
+                      .and_then(|p| self.object_field_int(p, "color"))
+                      .unwrap_or(-16_777_216)
+              }
+
+              fn fill_rect_cpu(&mut self, bitmap: ObjectId, x: f32, y: f32, w: f32, h: f32, color: Rgba8) {
+                  if !self.ensure_cpu_bitmap(bitmap) {
+                      return;
+                  }
+                  let Some(b) = self.cpu_bitmaps.get_mut(&bitmap) else {
+                      return;
+                  };
+                  let x0 = (x.min(x + w).round() as i64).clamp(0, b.w as i64);
+                  let x1 = (x.max(x + w).round() as i64).clamp(0, b.w as i64);
+                  let y0 = (y.min(y + h).round() as i64).clamp(0, b.h as i64);
+                  let y1 = (y.max(y + h).round() as i64).clamp(0, b.h as i64);
+                  for yy in y0..y1 {
+                      for xx in x0..x1 {
+                          let i = (yy * b.w as i64 + xx) as usize;
+                          b.px[i] = blend_over(b.px[i], color);
+                      }
+                  }
+                  b.dirty = true;
+              }
+
+              fn draw_bitmap_region(
+                  &mut self,
+                  canvas: ObjectId,
+                  target: Option<ObjectId>,
+                  bitmap: ObjectId,
+                  src: [i32; 4],
+                  dst: [f32; 4],
+                  tint: Rgba8,
+              ) {
+                  if !self.ensure_cpu_bitmap(bitmap) {
+                      return;
+                  }
+                  let [tx, ty, sx, sy] = self.canvas_xform(canvas, target);
+                  let x = tx + dst[0] * sx;
+                  let y = ty + dst[1] * sy;
+                  let w = dst[2] * sx;
+                  let h = dst[3] * sy;
+                  if w.abs() < 0.01 || h.abs() < 0.01 {
+                      return;
+                  }
+                  let (bw, bh) = match self.cpu_bitmaps.get(&bitmap) {
+                      Some(b) => (b.w as f32, b.h as f32),
+                      None => return,
+                  };
+                  let sl = (src[0] as f32).clamp(0.0, bw);
+                  let st = (src[1] as f32).clamp(0.0, bh);
+                  let sr = (src[2] as f32).clamp(0.0, bw);
+                  let sb = (src[3] as f32).clamp(0.0, bh);
+                  if sr <= sl || sb <= st {
+                      return;
+                  }
+                  match target {
+                      None => {
+                          let tex = self.bitmap_texture(bitmap);
+                          if tex == 0 {
+                              return;
+                          }
+                          let gles = &mut self.framework.gles;
+                          gles.enable(crate::gles::BLEND);
+                          gles.blend_func(crate::gles::SRC_ALPHA, crate::gles::ONE_MINUS_SRC_ALPHA);
+                          gles.draw_textured_region_pixels(
+                              x,
+                              y,
+                              w,
+                              h,
+                              tex,
+                              sl / bw,
+                              st / bh,
+                              sr / bw,
+                              sb / bh,
+                              tint,
+                          );
+                      }
+                      Some(dst_bitmap) => {
+                          if !self.ensure_cpu_bitmap(dst_bitmap) {
+                              return;
+                          }
+                          let source = match self.cpu_bitmaps.get(&bitmap) {
+                              Some(b) => b.clone(),
+                              None => return,
+                          };
+                          let Some(dst_buf) = self.cpu_bitmaps.get_mut(&dst_bitmap) else {
+                              return;
+                          };
+                          let ix0 = (x.min(x + w).floor() as i64).clamp(0, dst_buf.w as i64);
+                          let ix1 = (x.max(x + w).ceil() as i64).clamp(0, dst_buf.w as i64);
+                          let iy0 = (y.min(y + h).floor() as i64).clamp(0, dst_buf.h as i64);
+                          let iy1 = (y.max(y + h).ceil() as i64).clamp(0, dst_buf.h as i64);
+                          for yy in iy0..iy1 {
+                              for xx in ix0..ix1 {
+                                  let u = (xx as f32 + 0.5 - x) / w;
+                                  let v = (yy as f32 + 0.5 - y) / h;
+                                  if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                                      continue;
+                                  }
+                                  let spx = ((sl + u * (sr - sl)) as u32).min(source.w - 1);
+                                  let spy = ((st + v * (sb - st)) as u32).min(source.h - 1);
+                                  let p = tint_pixel(source.px[(spy * source.w + spx) as usize], tint);
+                                  let i = (yy * dst_buf.w as i64 + xx) as usize;
+                                  dst_buf.px[i] = blend_over(dst_buf.px[i], p);
+                              }
+                          }
+                          dst_buf.dirty = true;
+                      }
+                  }
+              }
+
+              /// Bitmap / Canvas / Matrix / Paint(alpha) handling. `Ok(None)` = not handled here.
+              pub(super) fn dispatch_canvas(
+                  &mut self,
+                  class_name: &str,
+                  method_name: &str,
+                  args: &[Value],
+              ) -> Result<Option<Value>, VmError> {
+                  match class_name {
+                      "Landroid/graphics/Canvas;" => self.canvas_call(method_name, args),
+                      "Landroid/graphics/Bitmap;" => self.bitmap_call(method_name, args),
+                      "Landroid/graphics/Matrix;" => self.matrix_call(method_name, args),
+                      "Landroid/graphics/Paint;" | "Landroid/text/TextPaint;" => {
+                          self.paint_call(method_name, args)
+                      }
+                      _ => Ok(None),
+                  }
+              }
+
+              fn paint_call(&mut self, method_name: &str, args: &[Value]) -> Result<Option<Value>, VmError> {
+                  let Some(paint) = opt_object(args, 0) else {
+                      return Ok(None);
+                  };
+                  let color = self.object_field_int(paint, "color").unwrap_or(-16_777_216) as u32;
+                  match method_name {
+                      "setAlpha" => {
+                          let alpha = (int_arg(args, 1)? as u32) & 0xff;
+                          let value = (color & 0x00ff_ffff) | (alpha << 24);
+                          self.set_object_field(paint, "color", Value::Int(value as i32));
+                          Ok(Some(Value::Void))
+                      }
+                      "getAlpha" => Ok(Some(Value::Int((color >> 24) as i32))),
+                      "setARGB" => {
+                          let value = (((int_arg(args, 1)? as u32) & 0xff) << 24)
+                              | (((int_arg(args, 2)? as u32) & 0xff) << 16)
+                              | (((int_arg(args, 3)? as u32) & 0xff) << 8)
+                              | ((int_arg(args, 4)? as u32) & 0xff);
+                          self.set_object_field(paint, "color", Value::Int(value as i32));
+                          Ok(Some(Value::Void))
+                      }
+                      _ => Ok(None),
+                  }
+              }
+
+              fn matrix_call(&mut self, method_name: &str, args: &[Value]) -> Result<Option<Value>, VmError> {
+                  let Some(matrix) = opt_object(args, 0) else {
+                      return Ok(None);
+                  };
+                  let sx = self.object_field_float(matrix, "sx").unwrap_or(1.0);
+                  let sy = self.object_field_float(matrix, "sy").unwrap_or(1.0);
+                  let rot = self.object_field_float(matrix, "rot").unwrap_or(0.0);
+                  match method_name {
+                      "<init>" | "reset" => {
+                          self.set_object_field(matrix, "sx", Value::Float(1.0));
+                          self.set_object_field(matrix, "sy", Value::Float(1.0));
+                          self.set_object_field(matrix, "rot", Value::Float(0.0));
+                          Ok(Some(Value::Void))
+                      }
+                      "preScale" | "postScale" | "setScale" => {
+                          let ax = float_arg(args, 1)?;
+                          let ay = float_arg(args, 2)?;
+                          let (nx, ny) = if method_name == "setScale" {
+                              (ax, ay)
+                          } else {
+                              (sx * ax, sy * ay)
+                          };
+                          self.set_object_field(matrix, "sx", Value::Float(nx));
+                          self.set_object_field(matrix, "sy", Value::Float(ny));
+                          Ok(Some(Value::Int(1)))
+                      }
+                      "preRotate" | "postRotate" | "setRotate" => {
+                          let degrees = float_arg(args, 1)?;
+                          let value = if method_name == "setRotate" {
+                              degrees
+                          } else {
+                              rot + degrees
+                          };
+                          self.set_object_field(matrix, "rot", Value::Float(value));
+                          Ok(Some(Value::Int(1)))
+                      }
+                      "setValues" => {
+                          if let Some(array) = opt_object(args, 1) {
+                              let mut v = [1.0f32, 0.0, 0.0, 0.0, 1.0];
+                              if let Some(HeapObject::Array { values, .. }) = self.heap_object(array) {
+                                  for (slot, value) in v.iter_mut().zip(values.iter()) {
+                                      *slot = match value {
+                                          Value::Float(f) => *f,
+                                          Value::Double(d) => *d as f32,
+                                          Value::Int(i) => *i as f32,
+                                          _ => *slot,
+                                      };
+                                  }
+                              }
+                              // row-major 3x3: [scaleX, skewX, transX, skewY, scaleY, ...]
+                              let nx = (v[0] * v[0] + v[3] * v[3]).sqrt();
+                              let ny = (v[1] * v[1] + v[4] * v[4]).sqrt();
+                              self.set_object_field(matrix, "sx", Value::Float(if v[0] < 0.0 { -nx } else { nx }));
+                              self.set_object_field(matrix, "sy", Value::Float(if v[4] < 0.0 { -ny } else { ny }));
+                              self.set_object_field(matrix, "rot", Value::Float(v[3].atan2(v[0]).to_degrees()));
+                          }
+                          Ok(Some(Value::Void))
+                      }
+                      "preTranslate" | "postTranslate" | "setTranslate" | "preSkew" | "postSkew" => {
+                          Ok(Some(Value::Int(1)))
+                      }
+                      "setSkew" => Ok(Some(Value::Void)),
+                      _ => Ok(None),
+                  }
+              }
+
+              fn bitmap_call(&mut self, method_name: &str, args: &[Value]) -> Result<Option<Value>, VmError> {
+                  match method_name {
+                      "createBitmap" => {
+                          if let Some(source) = opt_object(args, 0) {
+                              if !self.ensure_cpu_bitmap(source) {
+                                  return Ok(None);
+                              }
+                              let (sw, sh) = match self.cpu_bitmaps.get(&source) {
+                                  Some(b) => (b.w, b.h),
+                                  None => return Ok(None),
+                              };
+                              let (x, y, w, h) = if args.len() >= 5 {
+                                  (
+                                      int_arg(args, 1)?,
+                                      int_arg(args, 2)?,
+                                      int_arg(args, 3)?,
+                                      int_arg(args, 4)?,
+                                  )
+                              } else {
+                                  (0, 0, sw as i32, sh as i32)
+                              };
+                              let (mut nw, mut nh, mut px) = match self.cpu_bitmaps.get(&source) {
+                                  Some(b) => crop(&b.px, sw, sh, x, y, w, h),
+                                  None => return Ok(None),
+                              };
+                              if args.len() >= 7 {
+                                  if let Some(matrix) = opt_object(args, 5) {
+                                      let msx = self.object_field_float(matrix, "sx").unwrap_or(1.0);
+                                      let msy = self.object_field_float(matrix, "sy").unwrap_or(1.0);
+                                      let mrot = self.object_field_float(matrix, "rot").unwrap_or(0.0);
+                                      if (msx - 1.0).abs() > 1e-4 || (msy - 1.0).abs() > 1e-4 || mrot.abs() > 1e-4 {
+                                          let (tw, th, tp) = transform(&px, nw, nh, msx, msy, mrot);
+                                          nw = tw;
+                                          nh = th;
+                                          px = tp;
+                                      }
+                                  }
+                              }
+                              let id = self.new_cpu_bitmap(nw, nh, px);
+                              return Ok(Some(Value::Object(id)));
+                          }
+                          if let (Some(Value::Int(w)), Some(Value::Int(h))) = (args.first(), args.get(1)) {
+                              let nw = clamp_dim(*w as i64);
+                              let nh = clamp_dim(*h as i64);
+                              let id = self.new_cpu_bitmap(nw, nh, vec![TRANSPARENT; (nw * nh) as usize]);
+                              return Ok(Some(Value::Object(id)));
+                          }
+                          Ok(None)
+                      }
+                      "createScaledBitmap" => {
+                          let Some(source) = opt_object(args, 0) else {
+                              return Ok(None);
+                          };
+                          if !self.ensure_cpu_bitmap(source) {
+                              return Ok(None);
+                          }
+                          let nw = clamp_dim(int_arg(args, 1)? as i64);
+                          let nh = clamp_dim(int_arg(args, 2)? as i64);
+                          let px = match self.cpu_bitmaps.get(&source) {
+                              Some(b) => resize(&b.px, b.w, b.h, nw, nh),
+                              None => return Ok(None),
+                          };
+                          let id = self.new_cpu_bitmap(nw, nh, px);
+                          Ok(Some(Value::Object(id)))
+                      }
+                      "getPixel" | "setPixel" | "eraseColor" | "getPixels" | "setPixels" => {
+                          let Some(bitmap) = opt_object(args, 0) else {
+                              return Ok(None);
+                          };
+                          if !self.ensure_cpu_bitmap(bitmap) {
+                              return Ok(None);
+                          }
+                          match method_name {
+                              "getPixel" => {
+                                  let x = int_arg(args, 1)?;
+                                  let y = int_arg(args, 2)?;
+                                  let value = match self.cpu_bitmaps.get(&bitmap) {
+                                      Some(b) if x >= 0 && y >= 0 && (x as u32) < b.w && (y as u32) < b.h => {
+                                          pack_argb(b.px[(y as u32 * b.w + x as u32) as usize])
+                                      }
+                                      _ => 0,
+                                  };
+                                  Ok(Some(Value::Int(value)))
+                              }
+                              "setPixel" => {
+                                  let x = int_arg(args, 1)?;
+                                  let y = int_arg(args, 2)?;
+                                  let color = unpack_argb_color(int_arg(args, 3)? as u32);
+                                  if let Some(b) = self.cpu_bitmaps.get_mut(&bitmap) {
+                                      if x >= 0 && y >= 0 && (x as u32) < b.w && (y as u32) < b.h {
+                                          let i = (y as u32 * b.w + x as u32) as usize;
+                                          b.px[i] = color;
+                                          b.dirty = true;
+                                      }
+                                  }
+                                  Ok(Some(Value::Void))
+                              }
+                              "eraseColor" => {
+                                  let color = unpack_argb_color(int_arg(args, 1)? as u32);
+                                  if let Some(b) = self.cpu_bitmaps.get_mut(&bitmap) {
+                                      for p in b.px.iter_mut() {
+                                          *p = color;
+                                      }
+                                      b.dirty = true;
+                                  }
+                                  Ok(Some(Value::Void))
+                              }
+                              "getPixels" => {
+                                  // (int[] pixels, int offset, int stride, int x, int y, int w, int h)
+                                  let array = object_arg(args, 1)?;
+                                  let offset = int_arg(args, 2)?.max(0) as usize;
+                                  let stride = int_arg(args, 3)?.max(0) as usize;
+                                  let x = int_arg(args, 4)?;
+                                  let y = int_arg(args, 5)?;
+                                  let w = int_arg(args, 6)?.max(0);
+                                  let h = int_arg(args, 7)?.max(0);
+                                  if let (Some(b), Some(HeapObject::Array { values, .. })) =
+                                      (self.cpu_bitmaps.get(&bitmap), self.heap.get_mut(array as usize))
+                                  {
+                                      for row in 0..h {
+                                          for col in 0..w {
+                                              let sx = x + col;
+                                              let sy = y + row;
+                                              let idx = offset + row as usize * stride + col as usize;
+                                              if sx >= 0
+                                                  && sy >= 0
+                                                  && (sx as u32) < b.w
+                                                  && (sy as u32) < b.h
+                                                  && idx < values.len()
+                                              {
+                                                  values[idx] = Value::Int(pack_argb(
+                                                      b.px[(sy as u32 * b.w + sx as u32) as usize],
+                                                  ));
+                                              }
+                                          }
+                                      }
+                                  }
+                                  Ok(Some(Value::Void))
+                              }
+                              _ => {
+                                  // setPixels(int[] pixels, int offset, int stride, int x, int y, int w, int h)
+                                  let array = object_arg(args, 1)?;
+                                  let offset = int_arg(args, 2)?.max(0) as usize;
+                                  let stride = int_arg(args, 3)?.max(0) as usize;
+                                  let x = int_arg(args, 4)?;
+                                  let y = int_arg(args, 5)?;
+                                  let w = int_arg(args, 6)?.max(0);
+                                  let h = int_arg(args, 7)?.max(0);
+                                  let source: Vec<i32> = match self.heap_object(array) {
+                                      Some(HeapObject::Array { values, .. }) => values
+                                          .iter()
+                                          .map(|v| match v {
+                                              Value::Int(i) => *i,
+                                              _ => 0,
+                                          })
+                                          .collect(),
+                                      _ => Vec::new(),
+                                  };
+                                  if let Some(b) = self.cpu_bitmaps.get_mut(&bitmap) {
+                                      for row in 0..h {
+                                          for col in 0..w {
+                                              let dx = x + col;
+                                              let dy = y + row;
+                                              let idx = offset + row as usize * stride + col as usize;
+                                              if dx >= 0
+                                                  && dy >= 0
+                                                  && (dx as u32) < b.w
+                                                  && (dy as u32) < b.h
+                                                  && idx < source.len()
+                                              {
+                                                  b.px[(dy as u32 * b.w + dx as u32) as usize] =
+                                                      unpack_argb_color(source[idx] as u32);
+                                              }
+                                          }
+                                      }
+                                      b.dirty = true;
+                                  }
+                                  Ok(Some(Value::Void))
+                              }
+                          }
+                      }
+                      _ => Ok(None),
+                  }
+              }
+
+              fn canvas_call(&mut self, method_name: &str, args: &[Value]) -> Result<Option<Value>, VmError> {
+                  let Some(canvas) = opt_object(args, 0) else {
+                      return Ok(None);
+                  };
+                  let target = self.object_field_object(canvas, "target");
+                  match method_name {
+                      "<init>" => {
+                          if let Some(bitmap) = opt_object(args, 1) {
+                              self.set_object_field(canvas, "target", Value::Object(bitmap));
+                          }
+                          Ok(Some(Value::Void))
+                      }
+                      "setBitmap" => {
+                          let value = match opt_object(args, 1) {
+                              Some(bitmap) => Value::Object(bitmap),
+                              None => Value::Null,
+                          };
+                          self.set_object_field(canvas, "target", value);
+                          Ok(Some(Value::Void))
+                      }
+                      "getWidth" | "getHeight" if target.is_some() => {
+                          let bitmap = target.unwrap_or(0);
+                          let size = if self.ensure_cpu_bitmap(bitmap) {
+                              self.cpu_bitmaps.get(&bitmap).map(|b| (b.w, b.h))
+                          } else {
+                              None
+                          };
+                          let (w, h) = size.unwrap_or((1, 1));
+                          let size = if method_name == "getWidth" { w } else { h };
+                          Ok(Some(Value::Int(size as i32)))
+                      }
+                      "save" if target.is_some() => {
+                          let state = self.canvas_xform(canvas, target);
+                          let stack = self.canvas_stacks.entry(canvas).or_default();
+                          stack.push(state);
+                          Ok(Some(Value::Int(stack.len() as i32)))
+                      }
+                      "restore" if target.is_some() => {
+                          let state = self.canvas_stacks.get_mut(&canvas).and_then(|stack| stack.pop());
+                          if let Some(state) = state {
+                              self.set_canvas_xform(canvas, state);
+                          }
+                          Ok(Some(Value::Void))
+                      }
+                      "translate" if target.is_some() => {
+                          let [tx, ty, sx, sy] = self.canvas_xform(canvas, target);
+                          let nx = tx + float_arg(args, 1)? * sx;
+                          let ny = ty + float_arg(args, 2)? * sy;
+                          self.set_canvas_xform(canvas, [nx, ny, sx, sy]);
+                          Ok(Some(Value::Void))
+                      }
+                      "scale" if target.is_some() => {
+                          let [tx, ty, sx, sy] = self.canvas_xform(canvas, target);
+                          let nsx = sx * float_arg(args, 1)?;
+                          let nsy = sy * float_arg(args, 2)?;
+                          self.set_canvas_xform(canvas, [tx, ty, nsx, nsy]);
+                          Ok(Some(Value::Void))
+                      }
+                      "drawColor" => {
+                          let color = unpack_argb_color(int_arg(args, 1)? as u32);
+                          match target {
+                              Some(bitmap) => {
+                                  if self.ensure_cpu_bitmap(bitmap) {
+                                      if let Some(b) = self.cpu_bitmaps.get_mut(&bitmap) {
+                                          for p in b.px.iter_mut() {
+                                              *p = blend_over(*p, color);
+                                          }
+                                          b.dirty = true;
+                                      }
+                                  }
+                              }
+                              None => {
+                                  let (w, h) = self.framework.surface_size;
+                                  let gles = &mut self.framework.gles;
+                                  if color.a == 255 {
+                                      gles.clear_color(color);
+                                      gles.clear_mask(CLEAR_COLOR_BUFFER);
+                                  } else {
+                                      gles.disable(0x0DE1);
+                                      gles.enable(crate::gles::BLEND);
+                                      gles.blend_func(crate::gles::SRC_ALPHA, crate::gles::ONE_MINUS_SRC_ALPHA);
+                                      gles.draw_quad_pixels(0.0, 0.0, w as f32, h as f32, color);
+                                  }
+                              }
+                          }
+                          Ok(Some(Value::Void))
+                      }
+                      "drawRect" => {
+                          let (l, t, r, b, paint) = if let Some(rect) = opt_object(args, 1) {
+                              let v = self.rect_values(rect);
+                              (v[0], v[1], v[2], v[3], opt_object(args, 2))
+                          } else {
+                              (
+                                  float_arg(args, 1)?,
+                                  float_arg(args, 2)?,
+                                  float_arg(args, 3)?,
+                                  float_arg(args, 4)?,
+                                  opt_object(args, 5),
+                              )
+                          };
+                          let color = unpack_argb_color(self.paint_argb(paint) as u32);
+                          let [tx, ty, sx, sy] = self.canvas_xform(canvas, target);
+                          let x = tx + l * sx;
+                          let y = ty + t * sy;
+                          let w = (r - l) * sx;
+                          let h = (b - t) * sy;
+                          match target {
+                              Some(bitmap) => self.fill_rect_cpu(bitmap, x, y, w, h, color),
+                              None => {
+                                  let gles = &mut self.framework.gles;
+                                  gles.disable(0x0DE1);
+                                  gles.enable(crate::gles::BLEND);
+                                  gles.blend_func(crate::gles::SRC_ALPHA, crate::gles::ONE_MINUS_SRC_ALPHA);
+                                  gles.draw_quad_pixels(x, y, w, h, color);
+                              }
+                          }
+                          Ok(Some(Value::Void))
+                      }
+                      "drawBitmap" => {
+                          let Some(bitmap) = opt_object(args, 1) else {
+                              return Ok(Some(Value::Void));
+                          };
+                          if !self.ensure_cpu_bitmap(bitmap) {
+                              return Ok(Some(Value::Void));
+                          }
+                          let (bw, bh) = match self.cpu_bitmaps.get(&bitmap) {
+                              Some(b) => (b.w as i32, b.h as i32),
+                              None => return Ok(Some(Value::Void)),
+                          };
+                          let rect_variant = matches!(args.get(2), Some(Value::Object(_)) | Some(Value::Null));
+                          let (src, dst, paint) = if rect_variant {
+                              let src = match opt_object(args, 2) {
+                                  Some(rect) => {
+                                      let v = self.rect_values(rect);
+                                      [v[0] as i32, v[1] as i32, v[2] as i32, v[3] as i32]
+                                  }
+                                  None => [0, 0, bw, bh],
+                              };
+                              let dst = match opt_object(args, 3) {
+                                  Some(rect) => self.rect_values(rect),
+                                  None => [0.0, 0.0, bw as f32, bh as f32],
+                              };
+                              (
+                                  src,
+                                  [dst[0], dst[1], dst[2] - dst[0], dst[3] - dst[1]],
+                                  opt_object(args, 4),
+                              )
+                          } else {
+                              (
+                                  [0, 0, bw, bh],
+                                  [float_arg(args, 2)?, float_arg(args, 3)?, bw as f32, bh as f32],
+                                  opt_object(args, 4),
+                              )
+                          };
+                          let alpha = match paint {
+                              Some(_) => (self.paint_argb(paint) as u32 >> 24) as u8,
+                              None => 255,
+                          };
+                          let tint = Rgba8 {
+                              r: 255,
+                              g: 255,
+                              b: 255,
+                              a: alpha,
+                          };
+                          self.draw_bitmap_region(canvas, target, bitmap, src, dst, tint);
+                          Ok(Some(Value::Void))
+                      }
+                      "drawText" | "drawLine" | "drawOval" | "drawPath" | "drawRoundRect" | "drawCircle"
+                      | "drawPoint" | "drawARGB" | "drawRGB" => {
+                          log_once(method_name);
+                          Ok(Some(Value::Void))
+                      }
+                      _ => Ok(None),
+                  }
+              }
           }
-          """
-              open('src/dhlog.rs', 'w').write(s)
-              print('src/dhlog.rs slice tracing appended')
-
-          patch('src/vm.rs', [
-           ('    in_thread_slice: bool,\n',
-            '    in_thread_slice: bool,\n    thread_slices: u64,\n    thread_errors: u32,\n'),
-           ('            in_thread_slice: false,\n',
-            '            in_thread_slice: false,\n            thread_slices: 0,\n            thread_errors: 0,\n'),
-           ('            self.current_thread = Some(thread);\n            let outcome = if self.has_instance_method(thread, "run") {\n',
-            """            self.current_thread = Some(thread);
-                      let mark = crate::dhlog::slice_begin();
-                      let base_steps = self.config.max_steps;
-                      self.thread_slices += 1;
-                      self.config.max_steps =
-                          base_steps.saturating_mul(if self.thread_slices <= 20 { 10 } else { 2 });
-                      let outcome = if self.has_instance_method(thread, "run") {
-          """),
-           ("""            self.in_thread_slice = false;
-                      self.current_thread = None;
-                      match outcome {
-                          Some(Ok(_)) if self.frame_steps > self.config.max_steps => alive.push(thread),
-                          Some(Err(error)) => {
-                              crate::dhlog::vm_error("thread run", &error.to_string());
-                          }
-                          _ => {}
-                      }
-          """,
-            """            let used = self.frame_steps;
-                      let budget = self.config.max_steps;
-                      self.config.max_steps = base_steps;
-                      self.in_thread_slice = false;
-                      self.current_thread = None;
-                      match outcome {
-                          Some(Ok(_)) if used > budget => {
-                              crate::dhlog::slice_end(
-                                  mark,
-                                  &format!("yielded or hit the step cap ({budget} steps); the last native shows which"),
-                              );
-                              alive.push(thread);
-                          }
-                          Some(Ok(_)) => {
-                              crate::dhlog::slice_end(
-                                  mark,
-                                  &format!("run() RETURNED after {used} steps (thread finished)"),
-                              );
-                          }
-                          Some(Err(error)) => {
-                              crate::dhlog::slice_end(
-                                  mark,
-                                  &format!("run() FAILED after {used} steps: {error}"),
-                              );
-                              crate::dhlog::vm_error("thread run", &error.to_string());
-                              self.thread_errors += 1;
-                              if self.thread_errors < 300 {
-                                  alive.push(thread);
-                              }
-                          }
-                          None => crate::dhlog::slice_end(mark, "thread has no run() method"),
-                      }
-          """),
-           ('        for (holder, callback) in self.surface_callbacks.clone() {\n            if self.has_instance_method(callback, "surfaceCreated") {\n',
-            """        if let Some(view) = self.framework.content_views.get(&activity).copied() {
-                      let view_calls: Vec<(&str, Vec<Value>)> = vec![
-                          ("onAttachedToWindow", Vec::new()),
-                          ("onWindowVisibilityChanged", vec![Value::Int(0)]),
-                          (
-                              "onSizeChanged",
-                              vec![Value::Int(width), Value::Int(height), Value::Int(0), Value::Int(0)],
-                          ),
-                      ];
-                      for (name, call_args) in view_calls {
-                          if self.has_instance_method(view, name) {
-                              if let Err(error) = self.run_instance_method(view, name, call_args) {
-                                  crate::dhlog::vm_error(name, &error.to_string());
-                              }
-                          }
-                      }
-                  }
-                  for (holder, callback) in self.surface_callbacks.clone() {
-                      if self.has_instance_method(callback, "surfaceCreated") {
-          """),
-           ('        if self.has_instance_method(activity, "onWindowFocusChanged") {\n',
-            """        if let Some(view) = self.framework.content_views.get(&activity).copied() {
-                      if self.has_instance_method(view, "onWindowFocusChanged") {
-                          if let Err(error) =
-                              self.run_instance_method(view, "onWindowFocusChanged", vec![Value::Int(1)])
-                          {
-                              crate::dhlog::vm_error("view onWindowFocusChanged", &error.to_string());
-                          }
-                      }
-                  }
-                  if self.has_instance_method(activity, "onWindowFocusChanged") {
-          """),
-          ], 'thread_errors')
-
-          patch('src/runtime.rs', [
-           ('if commands == 0 && (n <= 3 || n % 300 == 0) {', 'if commands <= 1 && (n <= 3 || n % 300 == 0) {'),
-           ('{method} issued 0 GL commands (the app drew nothing: see earlier errors, or it is a Canvas-only game)',
-            '{method} issued only {commands} GL command(s) = just the frame clear, the app drew nothing (see SLICE lines: what does the draw thread do?)'),
-          ], 'issued only')
-          __DH_PY29__
-          python3 /tmp/slice_fix.py
-
-      - name: Clock fix (ROOT CAUSE of black screen - currentTimeMillis was 0, draw loop slept forever)
-        run: |
-          set -e
-          cat > /tmp/clock_fix.py <<'__DH_PY30__'
-          # ROOT CAUSE of the black screen (found by reading Armored_Strike classes.dex):
-          # the game's draw loop (RSLSurfaceView$a.run) is paced by System.currentTimeMillis() (com.requiem.a.aa timer):
-          # "if (elapsed < gameTimerRate) SystemClock.sleep(rest)" and only otherwise lockCanvas()/draw.
-          # The HLE returned 0 from currentTimeMillis() forever (elapsed always 0) and turned sleep() into a slice yield,
-          # and every slice restarts run() (timer reset) -> the loop slept forever and never drew a frame.
-          # Fix: real wall clock + virtual clock; sleep() inside a draw-thread slice advances the virtual clock and returns.
+          __DH_RS__
+          cat > /tmp/canvas_fix.py <<'__DH_PY29__'
+          # Software Canvas/Bitmap (src/vm/canvas.rs is written by the previous shell lines): hooks it into the VM.
           import sys
-          def patch(p, edits, marker):
-              s = open(p).read()
-              if marker in s:
-                  print(p, 'already patched'); return
-              for a, b in edits:
-                  if s.count(a) != 1:
-                      sys.exit('anchor missing or ambiguous (%d) in %s: %r' % (s.count(a), p, a[:90]))
-                  s = s.replace(a, b, 1)
-              open(p, 'w').write(s)
-              print(p, 'patched')
-
-          patch('src/vm.rs', [
-           ('static NANO_TIME_START: OnceLock<std::time::Instant> = OnceLock::new();\n',
-            """static NANO_TIME_START: OnceLock<std::time::Instant> = OnceLock::new();
-          static VIRTUAL_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-          static SLEEP_RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-          /// Milliseconds since the VM clock started: real time plus time "slept" by cooperative threads.
-          fn clock_ms() -> i64 {
-              let start = NANO_TIME_START.get_or_init(std::time::Instant::now);
-              start.elapsed().as_millis() as i64 + VIRTUAL_MS.load(std::sync::atomic::Ordering::Relaxed)
-          }
-          """),
-           ('            return Ok(Value::Long(clock.elapsed().as_nanos() as i64));\n',
-            '            return Ok(Value::Long(\n                clock.elapsed().as_nanos() as i64\n                    + VIRTUAL_MS.load(std::sync::atomic::Ordering::Relaxed) * 1_000_000,\n            ));\n'),
-           ('                "currentTimeMillis" => return Ok(Value::Long(0)),\n',
-            '                "currentTimeMillis" => return Ok(Value::Long(1_700_000_000_000 + clock_ms())),\n'),
-           ('        if class_name == "Landroid/os/Looper;" {\n',
-            """        if class_name == "Landroid/os/SystemClock;"
-                      && matches!(
-                          method_name,
-                          "uptimeMillis" | "elapsedRealtime" | "currentThreadTimeMillis"
-                      )
-                  {
-                      return Ok(Value::Long(clock_ms()));
-                  }
-                  if class_name == "Landroid/os/Looper;" {
-          """),
-           ('        if self.in_thread_slice\n            && matches!(\n                (class_name, method_name),\n                ("Ljava/lang/Object;", "wait")\n',
-            """        if self.in_thread_slice
-                      && matches!(
-                          (class_name, method_name),
-                          ("Landroid/os/SystemClock;", "sleep") | ("Ljava/lang/Thread;", "sleep")
-                      )
-                  {
-                      // a draw thread paces itself with sleep(): advance the virtual clock instead of ending the slice
-                      let ms = args
-                          .iter()
-                          .find_map(|value| match value {
-                              Value::Long(n) => Some(*n),
-                              Value::Int(n) => Some(*n as i64),
-                              _ => None,
-                          })
-                          .unwrap_or(1);
-                      if SLEEP_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
-                          VIRTUAL_MS.fetch_add(ms.clamp(0, 1000), std::sync::atomic::Ordering::Relaxed);
-                          return Ok(Value::Void);
-                      }
-                  }
-                  if self.in_thread_slice
-                      && matches!(
-                          (class_name, method_name),
-                          ("Ljava/lang/Object;", "wait")
-          """),
-           ('            let mark = crate::dhlog::slice_begin();\n',
-            '            let mark = crate::dhlog::slice_begin();\n            SLEEP_RUN.store(0, std::sync::atomic::Ordering::Relaxed);\n'),
-          ], 'fn clock_ms')
-          __DH_PY30__
-          python3 /tmp/clock_fix.py
+          p = 'src/vm.rs'
+          s = open(p).read()
+          if 'mod canvas;' in s:
+              print('already patched'); sys.exit(0)
+          def once(a, b):
+              global s
+              if s.count(a) != 1:
+                  sys.exit('anchor missing or ambiguous (%d): %r' % (s.count(a), a[:80]))
+              s = s.replace(a, b, 1)
+          once('use crate::Rgba8;\n', 'use crate::Rgba8;\n\nmod canvas;\n')
+          once('    view_touch_listeners: HashMap<ObjectId, ObjectId>,\n',
+               '    view_touch_listeners: HashMap<ObjectId, ObjectId>,\n'
+               '    /// CPU pixel buffers of android.graphics.Bitmap objects (see vm/canvas.rs).\n'
+               '    cpu_bitmaps: HashMap<ObjectId, canvas::CpuBitmap>,\n'
+               '    /// save()/restore() stacks of canvases that draw into a Bitmap.\n'
+               '    canvas_stacks: HashMap<ObjectId, Vec<[f32; 4]>>,\n')
+          once('            view_touch_listeners: HashMap::new(),\n',
+               '            view_touch_listeners: HashMap::new(),\n'
+               '            cpu_bitmaps: HashMap::new(),\n'
+               '            canvas_stacks: HashMap::new(),\n')
+          once('        if class_name.starts_with("Landroid/")\n            && matches!(\n',
+               '        // Software Canvas / Bitmap / Matrix / Paint alpha (games that draw via SurfaceHolder.lockCanvas)\n'
+               '        match self.dispatch_canvas(class_name, method_name, args) {\n'
+               '            Ok(Some(value)) => return Ok(value),\n'
+               '            Ok(None) => {}\n'
+               '            Err(error) => return Err(error),\n'
+               '        }\n'
+               '        if class_name.starts_with("Landroid/")\n            && matches!(\n')
+          open(p, 'w').write(s)
+          print('vm.rs patched')
+          __DH_PY29__
+          python3 /tmp/canvas_fix.py
 
       - name: Install Rust (stable for lockfile resolution, pinned nightly + rust-src for build-std)
         run: |
